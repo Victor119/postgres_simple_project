@@ -1,0 +1,38 @@
+putem sa experimentam lucruri noi
+
+paul esti manager iar angajatii colegii si le trimiti lor vedem atunci dar pana sa facem asta sa avem date random
+
+sa vad cum ganditi db-ul
+
+exista un site care trimite 
+
+putem testa sa vedem cum se comporta la 100 de oameni
+
+arhiva dupa ce este trimis excel si pdf-urile vreau o arhiva cu toate deci nu se poate crea arhiva daca s-a trimis doar excel fara pdf-uri
+
+trebuie sa facem un script de populare a tabelelor neaparat
+
+
+Un end to end flow ar fi ca cineva da trigger de crearea exce; dupa trigger creare pdf dupa da  trigger de trimis excel manager si dupa se 
+face end point de employees
+
+arhiva contine excel si pdf abia dupa ce au fost trimise catre manageri si employees
+
+managerul primeste excel 
+
+employee primeste doar pdf
+
+
+Ramane la latidunea noastra sa utilizam best practices si de cum structuram codul
+
+
+putem face UI din care sa trigaruim astea daca vrem
+
+
+Deci aplicatia trimite la manager si tot aplicatia trimite la employee
+
+
+Excel nu se trimite automat trebuie sa trigaruim
+
+
+arhiva sa fie un .zip
