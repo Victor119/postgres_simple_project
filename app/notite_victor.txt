@@ -1,0 +1,55 @@
+Yes, it is a very good idea to add a users table to manage administrator access and system-level permissions. This provides separation of concerns between regular employees and system administrators (e.g. the 
+manager during demo). This also enables role-based access control (RBAC), essential for any secure application.
+
+clienți: vor putea vizualiza produsele, dar pentru a plasa o comandă aceștia trebuie să se logheze pe baza unui cont deja existent sau pe care și-l vor putea crea
+
+producători: aceștia se vor conecta pe baza unui cont care le permite să introducă noi produse sau să le șteargă
+
+administrator: va gestiona baza de date pe baza unui cont și va putea șterge produse, elimina producători, adăuga promoții (prețurile produselor se vor actualiza automat la începutul și la sfârșitul promoției)
+
+
+6. Funcții și proceduri folosite
+-- despre cont:
+signUp(type, name, surname, username, password, email, address, country);
+logIn(email, username, password);
+updateUser(name, surname, username, password, email, address, country);
+deleteAccount(email, username, password);
+
+
+In My Input box pun un path pentru unde sa fie salvat excel generat/pdf generat:
+
+    Radio button selectat export excel
+
+    Radio button selectat export pdf
+
+In My Input box pun un email address pe prima linie iar pe a doua linie pun un path care reprezinta fisierul excel/pdf 
+
+    Radio button selectat pentru a trimite pdf
+
+    Radio button selectat pentru a trimite excel 
+
+
+
+Ca sa deschidem PostgreSQL
+
+    in start:
+
+        PgAdmin
+
+In PgAdmin 
+    in PostgreSQL in Databeses avem postres care este un default database
+
+    Ca sa cream un db click dreapta pe Databases 
+
+
+Ca sa rulezm scripturile .sql in PgAdmin:
+
+Click dreapta pe db -> query tool
+
+
+mai intai punem codul pentru crearea tabelelor si dupa Run/F5
+
+
+Acum ca sa vedem frumos cum s-au populat tabelele:
+
+Selectam tabelul si apasam pe butonul All Rows de langa Object Explorer

@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <title>Login</title>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Sans+Pro:wght@400;600;700&display=swap">
+        
+        <link rel="stylesheet" href="/static/styles/header.css" >
+        <link rel="stylesheet" href="/static/styles/login.css" >
+        
+
+        <!-- Pune iconitele la header-->
+        <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/npm/boxicons@latest/css/boxicons.min.css">
+
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    </head>
+
+    <body>
+      
+      <header>
+        <a href="/login" class="btn">
+          Log in <i class='bx bxs-user-detail'></i>
+        </a>
+      </header>
+      
+          <div class="content">
+            <form method="post" action="/login">
+              <div class="box">
+      
+                  <h1>LOG IN</h1>
+      
+                  <div class="container">
+                      <label for="username">Username</label><br>
+                      <input type="text" id="username" placeholder="Enter username" name="username"><br><br>
+      
+                      <label for="password">Password</label><br>
+                      <input type="password" id="password" placeholder="Enter password" name="password"><br><br>
+      
+                      <button type="submit">Login</button>
+                  </div>
+              </div>
+            </form>
+          </div>  
+
+
+          <script src="/static/scripts/main.js"></script>
+
+    </body>
+</html>
