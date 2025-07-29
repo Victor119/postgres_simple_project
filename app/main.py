@@ -126,6 +126,11 @@ HTML_TEMPLATE = """
                 <textarea id="edit_box" name="edit_box" style="width: 150px; height: 100px; font-family: monospace; font-size: 14px;">{{ current_input }}</textarea>
             </div>
             
+            <div style="position: absolute; top: 130px; left: 620px;">
+                <label for="edit_box2" style="font-family: sans-serif; font-size: 14px;">My Input&nbsp;2</label><br>
+                <textarea id="edit_box2" name="edit_box2" style="width: 150px; height: 100px; font-family: monospace; font-size: 14px;">{{ second_input }}</textarea>
+            </div>
+            
             <button class="return-button" type="submit">&Return</button>
         </form>
     </div>
@@ -529,8 +534,14 @@ def index():
     eb = MyEditBox(posEB, 150, 100, "&My Input")
     eb.setText("Initial edit text\nSecond line")
 
+    # Edit Second Box input 
+    posEB2 = Point(620, 130) # 400 px + 220 px = 620 px
+    eb2 = MyEditBox(posEB2, 150, 100, "&My Input 2")
+    eb2.setText("")
+
     if request.method == "POST":
         input_text = request.form.get("edit_box", "")
+        second_text_input = request.form.get("edit_box2", "")
         selected_choice = request.form.get("radio_option", "") # processing the value of the selected radio button
         
         # Process radio button selection
@@ -543,9 +554,14 @@ def index():
         # Set current_input for rendering
         current_input = input_text
         eb.setText(input_text)
+        
+        # Set current_second_input for rendering
+        current_second_input = second_text_input
+        eb2.setText(second_text_input)
     else:
         # For GET requests, use the initial text
         current_input = eb.getText()
+        current_second_input = eb2.getText()
         selected_choice = ""
     
     # Prepare render parameters
@@ -553,6 +569,7 @@ def index():
     render_params.update({
         "selected_choice": int(selected_choice) if selected_choice else 0,
         "current_input": current_input,
+        "current_second_input": current_second_input,
         "first_text": firstdb.getText(),
         "second_text": seconddb.getText(),
         "third_text": thirddb.getText(),

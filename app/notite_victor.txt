@@ -53,3 +53,18 @@ mai intai punem codul pentru crearea tabelelor si dupa Run/F5
 Acum ca sa vedem frumos cum s-au populat tabelele:
 
 Selectam tabelul si apasam pe butonul All Rows de langa Object Explorer
+
+
+
+
+Pe prima linie din input box se afla un path in acest caz folderul app/generated_excel iar in input box 2 se afla adresele de email pentru employee delimitati cu \n
+
+Daca este selectat primul radio Button cel cu Excel atunci va exporta datele Based on this information, implement a feature that generates an Excel file containing a summary of the following for each employee care a 
+fost gasit cu adresa de email:
+•	Employee name
+•	Salary to be paid for the current month
+•	Number of working days during the month
+•	Number of vacation days taken
+•	Additional bonuses (if any)
+in format specific excel si va fi salvat in folderul app/generated_excel iar numle filei sa fie un time_stamp si dupa ce a fost creata aceasta fila in generated_excel atunci 
+sa afiseze in firstDisplayBox (export Excel este labe-ul) mesajul: aici_numele_filei_excel.format_specific_excel created altfel afiseaza error
