@@ -1,12 +1,13 @@
-from datetime import datetime
+from datetime import datetime, date
+import calendar
 from flask import Flask, jsonify, render_template, render_template_string, request, redirect, session, url_for 
 from flask_sqlalchemy import SQLAlchemy
-
 import json
-
 import logging
-
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill
 import os
+import pandas as pd
 import uuid
 
 app = Flask(__name__)
@@ -92,6 +93,26 @@ HTML_TEMPLATE = """
             padding: 10px;
         }
     </style>
+    <script>
+        // Enforce max 256 characters per line and allow Enter key
+        document.addEventListener('DOMContentLoaded', function() {
+            function enforceMaxLineLength(textarea) {
+                const lines = textarea.value.split('\n');
+                for (let i = 0; i < lines.length; i++) {
+                    if (lines[i].length > 256) {
+                        lines[i] = lines[i].substring(0, 256);
+                    }
+                }
+                textarea.value = lines.join('\n');
+            }
+            ['edit_box', 'edit_box2'].forEach(function(id) {
+                const ta = document.getElementById(id);
+                if (ta) {
+                    ta.addEventListener('input', function() { enforceMaxLineLength(ta); });
+                }
+            });
+        });
+    </script>
 </head>
 <body>
     <div class="window">
@@ -138,6 +159,7 @@ HTML_TEMPLATE = """
 </html>
 """
 
+# ----------------------------- DATABASE Models ---------------------
 
 # model mapping la tabela users
 class User(db.Model):
@@ -150,7 +172,269 @@ class User(db.Model):
     organization_name  = db.Column(db.String(),    nullable=True)
     created_at         = db.Column(db.DateTime,    nullable=True, default=datetime.utcnow)
 
+# Employee model conform structurii existente
+class Employee(db.Model):
+    __tablename__ = 'employees'
+    employee_id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer)
+    first_name = db.Column(db.String(100))
+    last_name = db.Column(db.String(100))
+    cnp = db.Column(db.String(20), unique=True, nullable=False)
+    username = db.Column(db.String(64))
+    password = db.Column(db.String(128))
+    email = db.Column(db.String(120))
+    address = db.Column(db.String(200))
+    city = db.Column(db.String(100))
+    country = db.Column(db.String(100))
+
+    @property
+    def full_name(self):
+        """Returnează numele complet al angajatului"""
+        if self.first_name and self.last_name:
+            return f"{self.first_name} {self.last_name}"
+        elif self.first_name:
+            return self.first_name
+        elif self.last_name:
+            return self.last_name
+        else:
+            return self.username or "N/A"
+
+class Salary(db.Model):
+    __tablename__ = 'salaries'
+    salary_id = db.Column(db.Integer, primary_key=True)
+    employee_id = db.Column(db.Integer, db.ForeignKey('employees.employee_id'))
+    base_salary = db.Column(db.Numeric(10, 2))
+    month = db.Column(db.Date)
+
+class Bonus(db.Model):
+    __tablename__ = 'bonuses'
+    bonus_id = db.Column(db.Integer, primary_key=True)
+    employee_id = db.Column(db.Integer, db.ForeignKey('employees.employee_id'))
+    amount = db.Column(db.Numeric(10, 2))
+    description = db.Column(db.String(255))
+    month = db.Column(db.Date)
+
+class Vacation(db.Model):
+    __tablename__ = 'vacations'
+    vacation_id = db.Column(db.Integer, primary_key=True)
+    employee_id = db.Column(db.Integer, db.ForeignKey('employees.employee_id'))
+    start_date = db.Column(db.Date)
+    end_date = db.Column(db.Date)
+    number_of_days = db.Column(db.Integer)
+    reason = db.Column(db.String(255))
+
+class WorkDay(db.Model):
+    __tablename__ = 'work_days'
+    work_day_id = db.Column(db.Integer, primary_key=True)
+    employee_id = db.Column(db.Integer, db.ForeignKey('employees.employee_id'))
+    month = db.Column(db.Date)
+    number_of_days = db.Column(db.Integer)
+
+class ArchivedFile(db.Model):
+    __tablename__ = 'archived_files'
+    file_id = db.Column(db.Integer, primary_key=True)
+    employee_id = db.Column(db.Integer, db.ForeignKey('employees.employee_id'))
+    file_name = db.Column(db.String(255))
+    file_type = db.Column(db.String(50))
+    path = db.Column(db.String(500))
+    sent_date = db.Column(db.Date)
+
+# ----------------------------- HELPER FUNCTIONS FOR EXCEL ---------------------
+
+def get_current_month_start():
+    """Returneaza primul zi din luna curenta"""
+    today = date.today()
+    return date(today.year, today.month, 1)
+
+def get_current_month_end():
+    """ReturneazA ultima zi din luna curentA"""
+    today = date.today()
+    last_day = calendar.monthrange(today.year, today.month)[1]
+    return date(today.year, today.month, last_day)
+
+def get_employee_data_for_excel(email_addresses):
+    """
+    ColecteazA datele pentru toTi angajaTii cu adresele de email specificate
+    pentru luna curenta
+    """
+    try:
+        employees_data = []
+        current_month_start = get_current_month_start()
+        current_month_end = get_current_month_end()
+        
+        for email in email_addresses:
+            email = email.strip()
+            if not email:
+                continue
+                
+            # Find the employee by email
+            employee = Employee.query.filter_by(email=email).first()
+            if not employee:
+                continue
+            
+            # Get the salary for the current month
+            salary = Salary.query.filter(
+                Salary.employee_id == employee.employee_id,
+                Salary.month >= current_month_start,
+                Salary.month <= current_month_end
+            ).first()
+            
+            # Get the working days for the current month
+            work_days = WorkDay.query.filter(
+                WorkDay.employee_id == employee.employee_id,
+                WorkDay.month >= current_month_start,
+                WorkDay.month <= current_month_end
+            ).first()
+            
+            # Get the vacation days for the current month
+            vacation_days = db.session.query(db.func.sum(Vacation.number_of_days)).filter(
+                Vacation.employee_id == employee.employee_id,
+                Vacation.start_date >= current_month_start,
+                Vacation.end_date <= current_month_end
+            ).scalar() or 0
+            
+            # Get the bonuses for the current month
+            bonuses = Bonus.query.filter(
+                Bonus.employee_id == employee.employee_id,
+                Bonus.month >= current_month_start,
+                Bonus.month <= current_month_end
+            ).all()
+            
+            # Prepare the data for Excel
+            employee_info = {
+                'name': employee.full_name,
+                'email': employee.email,
+                'salary': float(salary.base_salary) if salary and salary.base_salary else 0.0,
+                'work_days': work_days.number_of_days if work_days else 0,
+                'vacation_days': vacation_days,
+                'bonuses': []
+            }
+            
+            # Add the bonuses
+            for bonus in bonuses:
+                employee_info['bonuses'].append({
+                    'amount': float(bonus.amount) if bonus.amount else 0.0,
+                    'description': bonus.description or 'N/A'
+                })
+            
+            employees_data.append(employee_info)
+        
+        return employees_data
+    
+    except Exception as e:
+        print(f"Error collecting employee data: {e}")
+        return []
+
+def create_excel_file(employees_data, output_path):
+    """
+    Creează fișierul Excel cu datele angajaților
+    """
+    try:
+        # Create the workbook and worksheet
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Employee Summary"
+        
+        # Styles for header
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+        header_alignment = Alignment(horizontal="center", vertical="center")
+        
+        # The headers of the columns
+        headers = [
+            "Employee Name", 
+            "Email", 
+            "Base Salary", 
+            "Working Days", 
+            "Vacation Days", 
+            "Total Bonuses", 
+            "Bonus Details"
+        ]
+        
+        # Add the headers
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_alignment
+        
+        # Add the employee data
+        for row, employee in enumerate(employees_data, 2):
+            ws.cell(row=row, column=1, value=employee['name'])
+            ws.cell(row=row, column=2, value=employee['email'])
+            ws.cell(row=row, column=3, value=employee['salary'])
+            ws.cell(row=row, column=4, value=employee['work_days'])
+            ws.cell(row=row, column=5, value=employee['vacation_days'])
+            
+            # Calculate the total bonuses
+            total_bonuses = sum(bonus['amount'] for bonus in employee['bonuses'])
+            ws.cell(row=row, column=6, value=total_bonuses)
+            
+            # Add the details of the bonuses
+            bonus_details = "; ".join([f"{bonus['description']}: {bonus['amount']}" for bonus in employee['bonuses']])
+            ws.cell(row=row, column=7, value=bonus_details if bonus_details else "No bonuses")
+        
+        # Adjust the width of the columns
+        column_widths = [20, 25, 15, 15, 15, 15, 40]
+        for col, width in enumerate(column_widths, 1):
+            ws.column_dimensions[ws.cell(row=1, column=col).column_letter].width = width
+        
+        # Save the file
+        wb.save(output_path)
+        return True
+        
+    except Exception as e:
+        print(f"Error creating Excel file: {e}")
+        return False
+
 # ----------------------------- API ENDPOINTS --------------------------------
+
+@app.route("/createAggregatedEmployeeData", methods=["POST"])
+def create_aggregated_employee_data():
+    """
+    API endpoint pentru generarea raportului Excel cu datele angajaților
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No JSON data provided'}), 400
+        
+        email_addresses = data.get('emails', [])
+        output_folder = data.get('output_folder', 'app/generated_excel')
+        
+        if not email_addresses:
+            return jsonify({'error': 'No email addresses provided'}), 400
+        
+        # make sure folder exists
+        os.makedirs(output_folder, exist_ok=True)
+        
+        # generate file name with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"employee_summary_{timestamp}.xlsx"
+        output_path = os.path.join(output_folder, filename)
+        
+        # collect data about employee
+        employees_data = get_employee_data_for_excel(email_addresses)
+        
+        if not employees_data:
+            return jsonify({'error': 'No employee data found for provided emails'}), 404
+        
+        # create excel file
+        success = create_excel_file(employees_data, output_path)
+        
+        if success:
+            return jsonify({
+                'success': True,
+                'filename': filename,
+                'path': output_path,
+                'message': f'{filename} created successfully'
+            }), 200
+        else:
+            return jsonify({'error': 'Failed to create Excel file'}), 500
+            
+    except Exception as e:
+        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
+
 
 @app.errorhandler(404)
 def not_found(error):
@@ -332,6 +616,11 @@ class Controller:
     def inpControl(self, aString: str): # apply the action from the GUI to the model
         self.model.setLastInput(aString)
         
+        
+        # Check if the 'export Excel' option (choice 1) is selected.
+        if self.model.getLastChoice() == 1:
+            self.handle_excel_export(aString)
+        
         #Compute based on choice and update view accordingly
         if self.model.getLastChoice() == 2: # check if the option corresponds to the n-th fibonacci number option
             try:
@@ -348,6 +637,64 @@ class Controller:
                 self.model.factView.setText(str(factorial_result))
             except Exception as e:
                 self.model.factView.setText("Invalid input")
+    
+    def handle_excel_export(self, input_text, second_input_text=""):
+        """
+        Gestionează exportul Excel bazat pe input-urile din GUI
+        """
+        try:
+            lines = input_text.strip().split('\n')
+            if not lines or not lines[0].strip():
+                if self.model.chView:
+                    self.model.chView.setText("Error: No folder path provided")
+                return
+            
+            # Prima linie este path-ul folderului
+            output_folder = lines[0].strip()
+            
+            # Dacă există un al doilea input box, folosește-l pentru email-uri
+            if second_input_text.strip():
+                email_lines = second_input_text.strip().split('\n')
+                email_addresses = [email.strip() for email in email_lines if email.strip()]
+            else:
+                # Altfel, email-urile sunt pe liniile următoare din primul input
+                email_addresses = [email.strip() for email in lines[1:] if email.strip()]
+            
+            if not email_addresses:
+                if self.model.chView:
+                    self.model.chView.setText("Error: No email addresses provided")
+                return
+            
+            # Asigură-te că folderul există
+            os.makedirs(output_folder, exist_ok=True)
+            
+            # Generează numele fișierului cu timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"employee_summary_{timestamp}.xlsx"
+            output_path = os.path.join(output_folder, filename)
+            
+            # Colectează datele angajaților
+            employees_data = get_employee_data_for_excel(email_addresses)
+            
+            if not employees_data:
+                if self.model.chView:
+                    self.model.chView.setText("Error: No employee data found")
+                return
+            
+            # Creează fișierul Excel
+            success = create_excel_file(employees_data, output_path)
+            
+            if success:
+                if self.model.chView:
+                    self.model.chView.setText(f"{filename} created")
+            else:
+                if self.model.chView:
+                    self.model.chView.setText("Error: Failed to create Excel file")
+                    
+        except Exception as e:
+            if self.model.chView:
+                self.model.chView.setText(f"Error: {str(e)}")
+            print(f"Excel export error: {e}")
     
     def fibonnaci(self, n):
         #base condition
@@ -512,6 +859,7 @@ def index():
 
     # Model and Controller
     model = Model()
+    model.setChView(firstdb)  # Set firstdb for displaying Excel export messages
     model.setInpView(seconddb)
     model.setFactView(thirddb)  # set the factorial view to the third display box
 
@@ -544,9 +892,15 @@ def index():
         second_text_input = request.form.get("edit_box2", "")
         selected_choice = request.form.get("radio_option", "") # processing the value of the selected radio button
         
-        # Process radio button selection
-        if selected_choice:
-            chCntrl.chControl(selected_choice)
+        # Truncam fiecare linie la maxim 256 de caractere
+        input_text = "\n".join([line[:256] for line in input_text.splitlines()])
+        second_text_input = "\n".join([line[:256] for line in second_text_input.splitlines()])
+        
+        # Pentru export Excel, pasează ambele input-uri
+        if int(selected_choice) == 1 if selected_choice else False:
+            chCntrl.handle_excel_export(input_text, second_text_input)
+        else:
+            chCntrl.inpControl(input_text)
         
         # Process input text
         chCntrl.inpControl(input_text)
