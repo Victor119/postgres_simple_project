@@ -1,13 +1,32 @@
-from datetime import datetime, date
+import base64
+from base64 import b64encode
 import calendar
+from datetime import datetime, date
+from dotenv import load_dotenv
+from email.message import EmailMessage
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email.mime.text import MIMEText
+from email.utils import formataddr
+from email import encoders
 from flask import Flask, jsonify, render_template, render_template_string, request, redirect, session, url_for 
 from flask_sqlalchemy import SQLAlchemy
 import json
 import logging
+import mailersend 
+from mailersend import emails
+import msal
+from O365 import Account, FileSystemTokenBackend
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill
 import os
 import pandas as pd
+import requests
+import smtplib
+import ssl
+import subprocess
+import time
+from typing import List
 import uuid
 
 app = Flask(__name__)
@@ -387,6 +406,192 @@ def create_excel_file(employees_data, output_path):
         print(f"Error creating Excel file: {e}")
         return False
 
+# ----------------------------- HELPER FUNCTIONS FOR PDF ---------------------
+
+def get_employee_data_for_pdf(email_addresses):
+    """
+    Collects the data required for the PDF export.
+    Only personal details (first & last name, employee ID, CNP) and
+    the salary due for the current month are returned.
+    """
+    try:
+        employees_data = []
+        current_month_start = get_current_month_start()
+        current_month_end   = get_current_month_end()
+
+        for email in (e.strip() for e in email_addresses):
+            if not email:
+                continue
+
+            employee = Employee.query.filter_by(email=email).first()
+            if not employee:
+                continue
+
+            salary_rec = Salary.query.filter(
+                Salary.employee_id == employee.employee_id,
+                Salary.month        >= current_month_start,
+                Salary.month        <= current_month_end
+            ).first()
+
+            employees_data.append({
+                "employee_id":   employee.employee_id,
+                "first_name":    employee.first_name or "",
+                "last_name":     employee.last_name  or "",
+                "cnp":           employee.cnp        or "",
+                "salary":        float(salary_rec.base_salary) if salary_rec and salary_rec.base_salary else 0.0,
+            })
+
+        return employees_data
+    except Exception as e:
+        print(f"Error collecting PDF data: {e}")
+        return []
+
+def create_pdf_file(employees_data, output_path):
+    """
+    Creates one aggregated PDF containing one short section
+    for every employee in `employees_data`.
+    """
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfgen       import canvas
+
+        c = canvas.Canvas(output_path, pagesize=A4)
+        width, height = A4
+        y = height - 40
+
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(40, y, "Monthly Salary Report")
+        y -= 30
+
+        for emp in employees_data:
+            if y < 120:          # simple page‑break
+                c.showPage()
+                y = height - 40
+                c.setFont("Helvetica-Bold", 16)
+                c.drawString(40, y, "Monthly Salary Report (cont.)")
+                y -= 30
+
+            c.setFont("Helvetica-Bold", 12)
+            full_name = f"{emp['first_name']} {emp['last_name']}".strip()
+            c.drawString(40, y, f"Employee: {full_name}")
+            y -= 15
+
+            c.setFont("Helvetica", 11)
+            c.drawString(60, y, f"Employee ID: {emp['employee_id']}")
+            y -= 15
+            c.drawString(60, y, f"CNP: {emp['cnp']}")
+            y -= 15
+            c.drawString(60, y, f"Salary for current month: {emp['salary']:.2f}")
+            y -= 25
+
+        c.save()
+        return True
+    except Exception as e:
+        print(f"Error creating PDF file: {e}")
+        return False
+
+# ----------------------------- EMAIL HELPER FUNCTION ---------------------
+
+def send_file_via_email(
+    file_path: str,
+    recipient_emails: List[str],
+    client_id: str = "f69f93d2-7437-462b-816d-42cd273538d0",
+    tenant_id: str = "0b3fc178-b730-4e8b-9843-e81259237b77"
+) -> bool:
+    """
+    Trimite email folosind delegated permissions - nu necesită admin consent
+    Utilizatorul se va autentifica interactiv în browser
+    """
+    
+    #1. Configure the MSAL application for delegated permissions
+    app = msal.PublicClientApplication(
+        client_id,
+        authority=f"https://login.microsoftonline.com/{tenant_id}"
+    )
+    
+    # Goals for delegated permissions (do not require admin consent)
+    scopes = ["https://graph.microsoft.com/Mail.Send"]
+    
+    # 2. Try to get the token from the cache.
+    accounts = app.get_accounts()
+    result = None
+    
+    if accounts:
+        #Try to obtain a silent token for the first account.
+        result = app.acquire_token_silent(scopes, account=accounts[0])
+    
+    if not result:
+        #If there is no token in the cache, request interactive authentication.
+        print("Se deschide browser-ul pentru autentificare...")
+        result = app.acquire_token_interactive(scopes)
+    
+    if "access_token" not in result:
+        print(f"Eroare la autentificare: {result.get('error_description')}")
+        return False
+    
+    token = result["access_token"]
+    print("Autentificare reusita!")
+    
+    # 3. Read the file
+    try:
+        with open(file_path, 'rb') as f:
+            file_content = f.read()
+        file_base64 = base64.b64encode(file_content).decode('utf-8')
+        filename = os.path.basename(file_path)
+    except Exception as ex:
+        print(f"Eroare la citirea fișierului: {ex}")
+        return False
+    
+    # 4. Build the payload
+    recipients = [{"emailAddress": {"address": email}} for email in recipient_emails]
+    
+    email_payload = {
+        "message": {
+            "subject": "Employee Summary Report",
+            "body": {
+                "contentType": "HTML",
+                "content": """
+                <p>Hello,</p>
+                <p>Please find attached the <strong>Employee Summary Report</strong>.</p>
+                <p>Best regards,<br/>HR Department</p>
+                """
+            },
+            "toRecipients": recipients,
+            "attachments": [
+                {
+                    "@odata.type": "#microsoft.graph.fileAttachment",
+                    "name": filename,
+                    "contentType": "application/octet-stream",
+                    "contentBytes": file_base64
+                }
+            ]
+        }
+    }
+    
+    # 5. Send the email
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json'
+    }
+    
+    graph_url = "https://graph.microsoft.com/v1.0/me/sendMail"
+    
+    try:
+        response = requests.post(graph_url, json=email_payload, headers=headers)
+        
+        if response.status_code == 202:
+            print("Email trimis cu succes!")
+            return True
+        else:
+            print(f"Eroare: {response.status_code}")
+            print(f"Răspuns: {response.text}")
+            return False
+            
+    except Exception as e:
+        print(f"Eroare la trimiterea email-ului: {e}")
+        return False
+
+
 # ----------------------------- API ENDPOINTS --------------------------------
 
 @app.route("/createAggregatedEmployeeData", methods=["POST"])
@@ -431,6 +636,112 @@ def create_aggregated_employee_data():
             }), 200
         else:
             return jsonify({'error': 'Failed to create Excel file'}), 500
+            
+    except Exception as e:
+        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
+
+@app.route("/createPdfForEmployees", methods=["POST"])
+def create_pdf_for_employees():
+    """
+    REST endpoint that receives a JSON body:
+        { "emails": ["a@b.com", …], "output_folder": "app/generated_pdf" }
+    and returns a single aggregated PDF report.
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No JSON data provided"}), 400
+
+        email_addresses = data.get("emails", [])
+        output_folder   = data.get("output_folder", "app/generated_pdf")
+
+        if not email_addresses:
+            return jsonify({"error": "No email addresses provided"}), 400
+
+        os.makedirs(output_folder, exist_ok=True)
+        employees_data = get_employee_data_for_pdf(email_addresses)
+        if not employees_data:
+            return jsonify({"error": "No employee data found for provided emails"}), 404
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename  = f"employee_summary_{timestamp}.pdf"
+        output_path = os.path.join(output_folder, filename)
+
+        if create_pdf_file(employees_data, output_path):
+            return jsonify({
+                "success": True,
+                "filename": filename,
+                "path": output_path,
+                "message": f"{filename} created successfully"
+            }), 200
+        else:
+            return jsonify({"error": "Failed to create PDF file"}), 500
+
+    except Exception as e:
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+
+@app.route("/sendAggregatedEmployeeData", methods=["POST"])
+def send_aggregated_employee_data():
+    """
+    API endpoint pentru trimiterea prin email a raportului Excel
+    Primeste JSON cu: 
+    {
+        "file_path": "app/generated_excel/employee_summary_timestamp.xlsx",
+        "emails": ["manager@acme.com", "hr@acme.com"]
+    }
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No JSON data provided'}), 400
+        
+        file_path = data.get('file_path', '')
+        recipient_emails = data.get('emails', [])
+        
+        if not file_path:
+            return jsonify({'error': 'No file path provided'}), 400
+        
+        if not recipient_emails:
+            return jsonify({'error': 'No recipient emails provided'}), 400
+        
+        # Check if the file exists
+        if not os.path.exists(file_path):
+            return jsonify({'error': f'File not found: {file_path}'}), 404
+        
+        # Send the email
+        success = send_file_via_email(file_path, recipient_emails)
+        
+        if success:
+            # Save information in the database for archive
+            try:
+                filename = os.path.basename(file_path)
+                for email in recipient_emails:
+                    # Find employee_id by email (optional)
+                    employee = Employee.query.filter_by(email=email).first()
+                    employee_id = employee.employee_id if employee else None
+                    
+                    archived_file = ArchivedFile(
+                        employee_id=employee_id,
+                        file_name=filename,
+                        file_type='Excel',
+                        path=file_path,
+                        sent_date=date.today()
+                    )
+                    db.session.add(archived_file)
+                
+                db.session.commit()
+            except Exception as e:
+                print(f"Error saving to archive: {e}")
+                # We are not returning an error because the email was sent successfully
+            
+            return jsonify({
+                'success': True,
+                'message': f'Excel file sent successfully to {len(recipient_emails)} recipients',
+                'file_path': file_path,
+                'recipients': recipient_emails
+            }), 200
+        else:
+            return jsonify({'error': 'Failed to send email'}), 500
             
     except Exception as e:
         return jsonify({'error': f'Internal server error: {str(e)}'}), 500
@@ -613,32 +924,96 @@ class Controller:
         except Exception as e:
             print("Invalid input to Controller.chControl:", aString, e)
             
-    def inpControl(self, aString: str): # apply the action from the GUI to the model
-        self.model.setLastInput(aString)
-        
+    def inpControl(self, first_input_box_text: str, second_input_box_text: str): # apply the action from the GUI to the model
+        self.model.setLastInput(first_input_box_text)
         
         # Check if the 'export Excel' option (choice 1) is selected.
         if self.model.getLastChoice() == 1:
-            self.handle_excel_export(aString)
+            self.handle_excel_export(first_input_box_text, second_input_box_text)
         
         #Compute based on choice and update view accordingly
-        if self.model.getLastChoice() == 2: # check if the option corresponds to the n-th fibonacci number option
+        elif self.model.getLastChoice() == 2: # check if the option corresponds to export PDF
             try:
-                n = int(aString.strip())
-                fib = self.fibonnaci(n)
-                self.model.inpView.setText(str(fib))
+                self.handle_pdf_export(first_input_box_text, second_input_box_text)
             except Exception as e:
                 self.model.inpView.setText("Invalid input")
                 
-        elif self.model.getLastChoice() == 3: # check if the option corresponds to factorial
-            try:
-                n = int(aString.strip())
-                factorial_result = self.factorial(n)
-                self.model.factView.setText(str(factorial_result))
-            except Exception as e:
-                self.model.factView.setText("Invalid input")
+        # Check if the 'send Excel' option (choice 3) is selected
+        elif self.model.getLastChoice() == 3:
+            self.handle_send_excel(first_input_box_text, second_input_box_text)
     
-    def handle_excel_export(self, input_text, second_input_text=""):
+    def handle_send_excel(self, input_text, second_input_text):
+        """
+        Gestioneaza trimiterea prin email a fisierului Excel
+        Prima linie din input_text = path catre fisierul Excel
+        second_input_text = email-urile destinatarilor (cate unul pe linie)
+        """
+        try:
+            lines = input_text.strip().split('\n')
+            if not lines or not lines[0].strip():
+                if self.model.factView:  # Folosim factView pentru "send Excel"
+                    self.model.factView.setText("Error: No file path provided")
+                return
+            
+            # Prima linie este path-ul către fișierul Excel
+            file_path = lines[0].strip()
+            
+            # Verifica daca fisierul exista
+            if not os.path.exists(file_path):
+                if self.model.factView:
+                    self.model.factView.setText("Error: File not found")
+                return
+            
+            # Colecteaza email-urile din al doilea input box
+            if second_input_text.strip():
+                email_lines = second_input_text.strip().split('\n')
+                recipient_emails = [email.strip() for email in email_lines if email.strip()]
+            else:
+                if self.model.factView:
+                    self.model.factView.setText("Error: No email addresses provided")
+                return
+            
+            if not recipient_emails:
+                if self.model.factView:
+                    self.model.factView.setText("Error: No valid email addresses")
+                return
+            
+            # Trimite fisierul prin email
+            success = send_file_via_email(file_path, recipient_emails)
+            
+            if success:
+                # Salveaza in arhiva
+                try:
+                    filename = os.path.basename(file_path)
+                    for email in recipient_emails:
+                        employee = Employee.query.filter_by(email=email).first()
+                        employee_id = employee.employee_id if employee else None
+                        
+                        archived_file = ArchivedFile(
+                            employee_id=employee_id,
+                            file_name=filename,
+                            file_type='Excel',
+                            path=file_path,
+                            sent_date=date.today()
+                        )
+                        db.session.add(archived_file)
+                    
+                    db.session.commit()
+                except Exception as e:
+                    print(f"Error saving to archive: {e}")
+                
+                if self.model.factView:
+                    self.model.factView.setText(f"Excel sent to {len(recipient_emails)} recipients")
+            else:
+                if self.model.factView:
+                    self.model.factView.setText("Error: Failed to send email")
+                    
+        except Exception as e:
+            if self.model.factView:
+                self.model.factView.setText(f"Error: {str(e)}")
+            print(f"Send Excel error: {e}")
+    
+    def handle_excel_export(self, input_text, second_input_text):
         """
         Gestionează exportul Excel bazat pe input-urile din GUI
         """
@@ -695,6 +1070,52 @@ class Controller:
             if self.model.chView:
                 self.model.chView.setText(f"Error: {str(e)}")
             print(f"Excel export error: {e}")
+    
+    def handle_pdf_export(self, input_text, second_input_text):
+        """
+        Generates the individual PDF reports with:
+            personal details (name, surname, employee ID, CNP)
+            salary for the current month
+            
+        Writes them to the folder given on the first line of input_text,
+        reading e-mails either from second_input_text or from the
+        remaining lines of input_text, and updates the “export PDF”
+        display box with success or error.
+        """
+        try:
+            # 1) determine output folder
+            lines = input_text.strip().split("\n")
+            if not lines or not lines[0].strip():
+                self.model.inpView.setText("Error: No folder path provided")
+                return
+            output_folder = lines[0].strip()
+            os.makedirs(output_folder, exist_ok=True)
+
+            # 2) collect e‑mails
+            block = second_input_text.strip() or "\n".join(lines[1:])
+            emails = [e.strip() for e in block.split("\n") if e.strip()]
+            if not emails:
+                self.model.inpView.setText("Error: No email addresses provided")
+                return
+
+            # 3) fetch the data and build PDF
+            data = get_employee_data_for_pdf(emails)
+            if not data:
+                self.model.inpView.setText("Error: No employee data found")
+                return
+
+            timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename    = f"employee_summary_{timestamp}.pdf"
+            output_path = os.path.join(output_folder, filename)
+
+            if create_pdf_file(data, output_path):
+                self.model.inpView.setText(f"{filename} created")
+            else:
+                self.model.inpView.setText("Error: Failed to create PDF file")
+
+        except Exception as e:
+            self.model.inpView.setText(f"Error: {e}")
+            print(f"PDF export error: {e}")
     
     def fibonnaci(self, n):
         #base condition
@@ -896,14 +1317,16 @@ def index():
         input_text = "\n".join([line[:256] for line in input_text.splitlines()])
         second_text_input = "\n".join([line[:256] for line in second_text_input.splitlines()])
         
-        # Pentru export Excel, pasează ambele input-uri
-        if int(selected_choice) == 1 if selected_choice else False:
-            chCntrl.handle_excel_export(input_text, second_text_input)
-        else:
-            chCntrl.inpControl(input_text)
+        try:
+            selected_choice_int = int(selected_choice)
+        except Exception:
+            selected_choice_int = 0
         
-        # Process input text
-        chCntrl.inpControl(input_text)
+        # Set the choice in model and process both inputs through inpControl
+        model.setLastChoice(selected_choice_int)
+        
+        # Process input text for both boxes
+        chCntrl.inpControl(input_text, second_text_input)
         
         # Set current_input for rendering
         current_input = input_text
