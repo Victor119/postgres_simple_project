@@ -181,31 +181,34 @@ HTML_TEMPLATE = """
 
 # ----------------------------- DATABASE Models ---------------------
 
-# model mapping la tabela users
-class User(db.Model):
-    __tablename__ = 'users'
-    user_id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(64), unique=True, nullable=False)
-    password = db.Column('password', db.String(128), nullable=False)
-    email    = db.Column(db.String(120))
-    role     = db.Column(db.String(20))
-    organization_name  = db.Column(db.String(),    nullable=True)
-    created_at         = db.Column(db.DateTime,    nullable=True, default=datetime.utcnow)
-
 # Employee model conform structurii existente
 class Employee(db.Model):
     __tablename__ = 'employees'
-    employee_id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer)
-    first_name = db.Column(db.String(100))
-    last_name = db.Column(db.String(100))
-    cnp = db.Column(db.String(20), unique=True, nullable=False)
-    username = db.Column(db.String(64))
-    password = db.Column(db.String(128))
-    email = db.Column(db.String(120))
-    address = db.Column(db.String(200))
-    city = db.Column(db.String(100))
-    country = db.Column(db.String(100))
+
+    employee_id = db.Column(db.Integer,
+                            primary_key=True)
+    manager_id  = db.Column(db.Integer,
+                            db.ForeignKey('employees.employee_id'),
+                            nullable=True)
+    role        = db.Column(db.String,      # 'manager' sau 'employee'
+                            nullable=False)
+    first_name  = db.Column(db.String(100))
+    last_name   = db.Column(db.String(100))
+    cnp         = db.Column(db.String(20),
+                            unique=True,
+                            nullable=False)
+    username    = db.Column(db.String(64),
+                            unique=True,
+                            nullable=False)
+    password    = db.Column(db.String(128),
+                            nullable=False)
+    email       = db.Column(db.String(120),
+                            unique=True,
+                            nullable=False)
+    address     = db.Column(db.String(200))
+    city        = db.Column(db.String(100))
+    country     = db.Column(db.String(100))
+    created_at  = db.Column(db.DateTime)
 
     @property
     def full_name(self):
@@ -822,8 +825,12 @@ def login():
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "").strip()
 
-        # query the database
-        user = User.query.filter_by(username=username, password=password).first()
+        # Cautam direct in tabela employees
+        user = Employee.query.filter_by(
+            username=username,
+            password=password
+        ).first()
+
         if user:
             session["user"] = user.username
             return redirect(url_for("index"))
@@ -831,7 +838,7 @@ def login():
             error = "Credentiale invalide"
             return render_template("login.html", error=error)
 
-    # GET – doar afisam formularul (fara eroare)
+    # GET: afisam formularul
     return render_template("login.html")
 
 @app.route("/logout")
@@ -1018,65 +1025,158 @@ class Controller:
         second_input_text: adresele de email (una per linie).
         Fiecare PDF va fi protejat cu parola = CNP-ul angajatului.
         """
-        import os
-        from datetime import date
-        from PyPDF2 import PdfReader, PdfWriter
+        try:
+            lines = input_text.strip().split('\n')
+            if not lines or not lines[0].strip():
+                if self.model.sendPdfView:
+                    self.model.sendPdfView.setText("Error: No file path provided")
+                return
+            
+            pdf_path = lines[0].strip()
+            
+            # Verifica daca fisierul exista si este PDF
+            if not os.path.exists(pdf_path):
+                if self.model.sendPdfView:
+                    self.model.sendPdfView.setText("Error: File not found")
+                return
+            
+            if not pdf_path.lower().endswith('.pdf'):
+                if self.model.sendPdfView:
+                    self.model.sendPdfView.setText("Error: File is not a PDF")
+                return
 
-        lines = input_text.strip().split('\n')
-        if not lines or not lines[0].strip():
-            if self.model.factView:
-                self.model.factView.setText("Error: No file path provided")
-            return
-        pdf_path = lines[0].strip()
-        if not os.path.exists(pdf_path):
-            if self.model.factView:
-                self.model.factView.setText("Error: File not found")
-            return
+            # Colecteaza email-urile din al doilea input box
+            emails = [e.strip() for e in (second_input_text.strip().split('\n')) if e.strip()]
+            if not emails:
+                if self.model.sendPdfView:
+                    self.model.sendPdfView.setText("Error: No email addresses provided")
+                return
 
-        emails = [e.strip() for e in (second_input_text.strip().split('\n')) if e.strip()]
-        if not emails:
-            if self.model.factView:
-                self.model.factView.setText("Error: No email addresses provided")
-            return
+            results = []
+            successful_sends = 0
+            
+            for email in emails:
+                try:
+                    # Gaseste angajatul si CNP-ul
+                    emp = Employee.query.filter_by(email=email).first()
+                    if not emp or not emp.cnp:
+                        results.append(f"{email}: Employee or CNP not found")
+                        continue
 
-        results = []
-        for email in emails:
-            # gaseste angajat si CNP
-            emp = Employee.query.filter_by(email=email).first()
-            if not emp or not emp.cnp:
-                results.append(f"{email}: Employee or CNP not found")
-                continue
+                    # Creeaza fisierul PDF criptat
+                    reader = PdfReader(pdf_path)
+                    writer = PdfWriter()
+                    
+                    # Adauga toate paginile
+                    for page in reader.pages:
+                        writer.add_page(page)
+                    
+                    # Cripteaza cu CNP-ul angajatului
+                    writer.encrypt(user_password=emp.cnp, owner_password=emp.cnp)
 
-            # cripteaza PDF-ul
+                    # Creeaza path-ul pentru fisierul criptat
+                    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+                    encrypted_filename = f"{base_name}_encrypted_{emp.employee_id}.pdf"
+                    encrypted_path = os.path.join(os.path.dirname(pdf_path), encrypted_filename)
+                    
+                    # Salveaza fiaierul criptat
+                    with open(encrypted_path, 'wb') as out_f:
+                        writer.write(out_f)
+
+                    # Verifica ca fisierul criptat a fost creat
+                    if not os.path.exists(encrypted_path):
+                        results.append(f"{email}: Failed to create encrypted PDF")
+                        continue
+
+                    # Trimite email-ul
+                    print(f"Attempting to send {encrypted_path} to {email}")
+                    success = send_file_via_email(encrypted_path, [email])
+                    
+                    if success:
+                        successful_sends += 1
+                        results.append(f"{email}: sent")
+                        
+                        # Arhiveaza daca a fost trimis cu succes
+                        try:
+                            arch = ArchivedFile(
+                                employee_id=emp.employee_id,
+                                file_name=encrypted_filename,
+                                file_type='PDF',
+                                path=encrypted_path,
+                                sent_date=date.today()
+                            )
+                            db.session.add(arch)
+                        except Exception as archive_error:
+                            print(f"Archive error for {email}: {archive_error}")
+                            
+                    else:
+                        results.append(f"{email}: failed to send")
+                        
+                except Exception as e:
+                    print(f"Error processing {email}: {str(e)}")
+                    results.append(f"{email}: Error - {str(e)}")
+
+            # Commit la baza de date pentru arhivare
+            try:
+                db.session.commit()
+            except Exception as commit_error:
+                print(f"Database commit error: {commit_error}")
+                db.session.rollback()
+
+            # Actualizeaza view-ul cu rezultatele
+            if self.model.sendPdfView:
+                summary = f"Sent: {successful_sends}/{len(emails)}. Details: " + "; ".join(results[:3])  # Limiteaza output-ul
+                if len(results) > 3:
+                    summary += f"... and {len(results) - 3} more"
+                self.model.sendPdfView.setText(summary)
+                    
+        except Exception as e:
+            print(f"Send PDF error: {e}")
+            if self.model.sendPdfView:
+                self.model.sendPdfView.setText(f"Error: {str(e)}")
+
+
+    # Funcție helper pentru debugging
+    def debug_pdf_sending(pdf_path, email):
+        """
+        Funcție de debugging pentru a testa trimiterea PDF-urilor
+        """
+        print(f"=== DEBUG PDF SENDING ===")
+        print(f"PDF Path: {pdf_path}")
+        print(f"File exists: {os.path.exists(pdf_path)}")
+        print(f"Email: {email}")
+        
+        # Verifică angajatul
+        emp = Employee.query.filter_by(email=email).first()
+        if emp:
+            print(f"Employee found: {emp.full_name}, CNP: {emp.cnp}")
+        else:
+            print("Employee not found")
+            return False
+        
+        try:
+            # Test PDF reading
             reader = PdfReader(pdf_path)
+            print(f"PDF pages: {len(reader.pages)}")
+            
+            # Test encryption
             writer = PdfWriter()
-            for p in reader.pages:
-                writer.add_page(p)
-            writer.encrypt(user_pwd=emp.cnp)
-
-            encrypted_path = f"{os.path.splitext(pdf_path)[0]}_{emp.employee_id}.pdf"
-            with open(encrypted_path, 'wb') as out_f:
-                writer.write(out_f)
-
-            # trimite email
-            success = send_file_via_email(encrypted_path, [email])
-            status = "sent" if success else "failed"
-            results.append(f"{email}: {status}")
-
-            # arhiveaza daca a fost trimis
-            if success:
-                arch = ArchivedFile(
-                    employee_id=emp.employee_id,
-                    file_name=os.path.basename(encrypted_path),
-                    file_type='PDF',
-                    path=encrypted_path,
-                    sent_date=date.today()
-                )
-                db.session.add(arch)
-        db.session.commit()
-
-        if self.model.factView:
-            self.model.factView.setText("; ".join(results))
+            for page in reader.pages:
+                writer.add_page(page)
+            writer.encrypt(user_password=emp.cnp, owner_password=emp.cnp)
+            
+            test_path = f"test_encrypted_{emp.employee_id}.pdf"
+            with open(test_path, 'wb') as f:
+                writer.write(f)
+            
+            print(f"Encrypted PDF created: {test_path}")
+            print(f"Encrypted file size: {os.path.getsize(test_path)} bytes")
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error in PDF processing: {e}")
+            return False
     
     def handle_send_excel(self, input_text, second_input_text):
         """
@@ -1396,9 +1496,10 @@ def index():
 
     # Model and Controller
     model = Model()
-    model.setChView(firstdb)  # Set firstdb for displaying Excel export messages
-    model.setInpView(seconddb)
+    model.setChView(firstdb)    # Set firstdb for displaying Excel export messages
+    model.setInpView(seconddb)  # Set seconddb for PDF export messages (choice 2)
     model.setFactView(thirddb)  # set the factorial view to the third display box
+    model.setSendPdf(fourthdb)  # Set fourthdb for send PDF messages (choice 4)
 
     chCntrl = Controller()
     chCntrl.setModel(model)
