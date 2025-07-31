@@ -285,6 +285,12 @@ def get_employee_data_for_excel(email_addresses):
         current_month_start = get_current_month_start()
         current_month_end = get_current_month_end()
         
+        # Dacă nu s-au dat email-uri, includem toți angajații
+        if not email_addresses:
+            email_addresses = [
+                emp.email
+                for emp in Employee.query.with_entities(Employee.email).all()
+            ]
         for email in email_addresses:
             email = email.strip()
             if not email:
@@ -1263,18 +1269,14 @@ class Controller:
             # The first line is the path of the folder.
             output_folder = lines[0].strip()
             
-            # If there is a second input box, use it for emails.
+            # Colectam email-uri, daca exista
             if second_input_text.strip():
-                email_lines = second_input_text.strip().split('\n')
-                email_addresses = [email.strip() for email in email_lines if email.strip()]
+                email_addresses = [
+                    e.strip() for e in second_input_text.splitlines() if e.strip()
+                ]
             else:
-                # Otherwise, the emails are on the following lines of the first input.
-                email_addresses = [email.strip() for email in lines[1:] if email.strip()]
-            
-            if not email_addresses:
-                if self.model.chView:
-                    self.model.chView.setText("Error: No email addresses provided")
-                return
+                # daca e gola, vom lasa lista goala si helper-ul va prelua toate email-urile
+                email_addresses = []
             
             # Make sure that the folder exists.
             os.makedirs(output_folder, exist_ok=True)
