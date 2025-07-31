@@ -20,6 +20,7 @@ from O365 import Account, FileSystemTokenBackend
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill
 import os
+from pypdf import PdfReader, PdfWriter
 import pandas as pd
 import requests
 import smtplib
@@ -746,6 +747,70 @@ def send_aggregated_employee_data():
     except Exception as e:
         return jsonify({'error': f'Internal server error: {str(e)}'}), 500
 
+@app.route("/sendPdfToEmployees", methods=["POST"])
+def send_pdf_to_employees():
+    """
+    API endpoint pentru trimiterea PDF-urilor protejate cu parola (CNP) catre angajati.
+    Asteapta JSON:
+    {
+        "file_path": "app/generated_pdf/employee_summary_....pdf",
+        "emails": ["a@b.com", "c@d.com"]
+    }
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No JSON data provided'}), 400
+
+        pdf_path = data.get('file_path', '').strip()
+        emails   = data.get('emails', [])
+        if not pdf_path:
+            return jsonify({'error': 'No file path provided'}), 400
+        if not pdf_path.lower().endswith('.pdf'):
+            return jsonify({'error': 'Provided file is not a PDF'}), 400
+        if not emails:
+            return jsonify({'error': 'No recipient emails provided'}), 400
+        if not os.path.exists(pdf_path):
+            return jsonify({'error': f'File not found: {pdf_path}'}), 404
+
+        results = []
+        for email in emails:
+            emp = Employee.query.filter_by(email=email).first()
+            if not emp or not emp.cnp:
+                results.append({'email': email, 'status': 'Employee or CNP not found'})
+                continue
+
+            # encryption
+            reader = PdfReader(pdf_path)
+            writer = PdfWriter()
+            for p in reader.pages:
+                writer.add_page(p)
+            writer.encrypt(user_pwd=emp.cnp)
+
+            encrypted_path = f"{os.path.splitext(pdf_path)[0]}_{emp.employee_id}.pdf"
+            with open(encrypted_path, 'wb') as f_out:
+                writer.write(f_out)
+
+            # send
+            sent = send_file_via_email(encrypted_path, [email])
+            status = 'sent' if sent else 'failed'
+            results.append({'email': email, 'status': status})
+
+            if sent:
+                arch = ArchivedFile(
+                    employee_id=emp.employee_id,
+                    file_name=os.path.basename(encrypted_path),
+                    file_type='PDF',
+                    path=encrypted_path,
+                    sent_date=date.today()
+                )
+                db.session.add(arch)
+
+        db.session.commit()
+        return jsonify({'results': results}), 200
+
+    except Exception as e:
+        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
 
 @app.errorhandler(404)
 def not_found(error):
@@ -941,6 +1006,77 @@ class Controller:
         # Check if the 'send Excel' option (choice 3) is selected
         elif self.model.getLastChoice() == 3:
             self.handle_send_excel(first_input_box_text, second_input_box_text)
+        
+        # Check if the 'send PDF' option (choice 4) is selected
+        elif self.model.getLastChoice() == 4:
+            self.handle_send_pdf(first_input_box_text, second_input_box_text)
+    
+    def handle_send_pdf(self, input_text, second_input_text):
+        """
+        Gestioneaza trimiterea prin email a fisierelor PDF.
+        Prima linie din input_text: path catre fisierul PDF.
+        second_input_text: adresele de email (una per linie).
+        Fiecare PDF va fi protejat cu parola = CNP-ul angajatului.
+        """
+        import os
+        from datetime import date
+        from PyPDF2 import PdfReader, PdfWriter
+
+        lines = input_text.strip().split('\n')
+        if not lines or not lines[0].strip():
+            if self.model.factView:
+                self.model.factView.setText("Error: No file path provided")
+            return
+        pdf_path = lines[0].strip()
+        if not os.path.exists(pdf_path):
+            if self.model.factView:
+                self.model.factView.setText("Error: File not found")
+            return
+
+        emails = [e.strip() for e in (second_input_text.strip().split('\n')) if e.strip()]
+        if not emails:
+            if self.model.factView:
+                self.model.factView.setText("Error: No email addresses provided")
+            return
+
+        results = []
+        for email in emails:
+            # gaseste angajat si CNP
+            emp = Employee.query.filter_by(email=email).first()
+            if not emp or not emp.cnp:
+                results.append(f"{email}: Employee or CNP not found")
+                continue
+
+            # cripteaza PDF-ul
+            reader = PdfReader(pdf_path)
+            writer = PdfWriter()
+            for p in reader.pages:
+                writer.add_page(p)
+            writer.encrypt(user_pwd=emp.cnp)
+
+            encrypted_path = f"{os.path.splitext(pdf_path)[0]}_{emp.employee_id}.pdf"
+            with open(encrypted_path, 'wb') as out_f:
+                writer.write(out_f)
+
+            # trimite email
+            success = send_file_via_email(encrypted_path, [email])
+            status = "sent" if success else "failed"
+            results.append(f"{email}: {status}")
+
+            # arhiveaza daca a fost trimis
+            if success:
+                arch = ArchivedFile(
+                    employee_id=emp.employee_id,
+                    file_name=os.path.basename(encrypted_path),
+                    file_type='PDF',
+                    path=encrypted_path,
+                    sent_date=date.today()
+                )
+                db.session.add(arch)
+        db.session.commit()
+
+        if self.model.factView:
+            self.model.factView.setText("; ".join(results))
     
     def handle_send_excel(self, input_text, second_input_text):
         """
@@ -1015,7 +1151,7 @@ class Controller:
     
     def handle_excel_export(self, input_text, second_input_text):
         """
-        Gestionează exportul Excel bazat pe input-urile din GUI
+        Gestioneaza exportul Excel bazat pe input-urile din GUI
         """
         try:
             lines = input_text.strip().split('\n')
@@ -1024,15 +1160,15 @@ class Controller:
                     self.model.chView.setText("Error: No folder path provided")
                 return
             
-            # Prima linie este path-ul folderului
+            # The first line is the path of the folder.
             output_folder = lines[0].strip()
             
-            # Dacă există un al doilea input box, folosește-l pentru email-uri
+            # If there is a second input box, use it for emails.
             if second_input_text.strip():
                 email_lines = second_input_text.strip().split('\n')
                 email_addresses = [email.strip() for email in email_lines if email.strip()]
             else:
-                # Altfel, email-urile sunt pe liniile următoare din primul input
+                # Otherwise, the emails are on the following lines of the first input.
                 email_addresses = [email.strip() for email in lines[1:] if email.strip()]
             
             if not email_addresses:
@@ -1040,15 +1176,15 @@ class Controller:
                     self.model.chView.setText("Error: No email addresses provided")
                 return
             
-            # Asigură-te că folderul există
+            # Make sure that the folder exists.
             os.makedirs(output_folder, exist_ok=True)
             
-            # Generează numele fișierului cu timestamp
+            # Generate the filename with timestamp
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"employee_summary_{timestamp}.xlsx"
             output_path = os.path.join(output_folder, filename)
             
-            # Colectează datele angajaților
+            # Collect the employees' data
             employees_data = get_employee_data_for_excel(email_addresses)
             
             if not employees_data:
@@ -1056,7 +1192,7 @@ class Controller:
                     self.model.chView.setText("Error: No employee data found")
                 return
             
-            # Creează fișierul Excel
+            # Create the Excel file
             success = create_excel_file(employees_data, output_path)
             
             if success:
@@ -1116,26 +1252,6 @@ class Controller:
         except Exception as e:
             self.model.inpView.setText(f"Error: {e}")
             print(f"PDF export error: {e}")
-    
-    def fibonnaci(self, n):
-        #base condition
-        if(n <= 1):
-            return n
-        
-        #problem broken down into 2 function calls
-        #and their results combined and returned
-        last = self.fibonnaci(n - 1)
-        slast = self.fibonnaci(n - 2)
-        
-        return last + slast
-
-    def factorial(self, n):  # the function for factorial
-        if n < 0:
-            return "Error: negative number"
-        P = 1
-        for i in range(1, n + 1):
-            P *= i
-        return P
 
 # ----------------------------- VIEW-CONTROLLER ASSOCIATION --------------------
 
