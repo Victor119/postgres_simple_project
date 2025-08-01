@@ -1,34 +1,18 @@
 import base64
-from base64 import b64encode
 import calendar
-from datetime import datetime, date
-from dotenv import load_dotenv
-from email.message import EmailMessage
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email.mime.text import MIMEText
-from email.utils import formataddr
-from email import encoders
+from datetime import datetime, date, timedelta
 from flask import Flask, jsonify, render_template, render_template_string, request, redirect, session, url_for 
 from flask_sqlalchemy import SQLAlchemy
-import json
-import logging
-import mailersend 
-from mailersend import emails
 import msal
-from O365 import Account, FileSystemTokenBackend
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill
 import os
 from pypdf import PdfReader, PdfWriter
 import pandas as pd
 import requests
-import smtplib
-import ssl
-import subprocess
-import time
+import shutil
 from typing import List
-import uuid
+import zipfile
 
 app = Flask(__name__)
 
@@ -275,15 +259,28 @@ def get_current_month_end():
     last_day = calendar.monthrange(today.year, today.month)[1]
     return date(today.year, today.month, last_day)
 
+def get_previous_month_range():
+    """
+    Returnează primul și ultimul day din luna precedentă față de data curentă.
+    Exemplu: azi este 2025-08-01, va returna (2025-07-01, 2025-07-31)
+    """
+    today = date.today()
+    # 1) prima zi din luna curentă
+    first_of_this = date(today.year, today.month, 1)
+    # 2) ultima zi din luna precedentă = prima zi din luna curentă minus o zi
+    last_of_prev = first_of_this - timedelta(days=1)
+    # 3) prima zi din luna precedentă
+    first_of_prev = date(last_of_prev.year, last_of_prev.month, 1)
+    return first_of_prev, last_of_prev
+
 def get_employee_data_for_excel(email_addresses):
     """
-    ColecteazA datele pentru toTi angajaTii cu adresele de email specificate
-    pentru luna curenta
+    Colectează datele pentru toți angajații cu adresele specificate
+    pentru luna precedentă față de data curentă.
     """
     try:
         employees_data = []
-        current_month_start = get_current_month_start()
-        current_month_end = get_current_month_end()
+        start, end = get_previous_month_range()
         
         # Dacă nu s-au dat email-uri, includem toți angajații
         if not email_addresses:
@@ -291,45 +288,46 @@ def get_employee_data_for_excel(email_addresses):
                 emp.email
                 for emp in Employee.query.with_entities(Employee.email).all()
             ]
+        
         for email in email_addresses:
             email = email.strip()
             if not email:
                 continue
                 
-            # Find the employee by email
+            # găsim angajatul
             employee = Employee.query.filter_by(email=email).first()
             if not employee:
                 continue
             
-            # Get the salary for the current month
+            # salariul pentru luna precedentă
             salary = Salary.query.filter(
                 Salary.employee_id == employee.employee_id,
-                Salary.month >= current_month_start,
-                Salary.month <= current_month_end
+                Salary.month >= start,
+                Salary.month <= end
             ).first()
             
-            # Get the working days for the current month
+            # zile lucrate pentru luna precedentă
             work_days = WorkDay.query.filter(
                 WorkDay.employee_id == employee.employee_id,
-                WorkDay.month >= current_month_start,
-                WorkDay.month <= current_month_end
+                WorkDay.month >= start,
+                WorkDay.month <= end
             ).first()
             
-            # Get the vacation days for the current month
+            # zile de concediu în luna precedentă
             vacation_days = db.session.query(db.func.sum(Vacation.number_of_days)).filter(
                 Vacation.employee_id == employee.employee_id,
-                Vacation.start_date >= current_month_start,
-                Vacation.end_date <= current_month_end
+                Vacation.start_date >= start,
+                Vacation.end_date <= end
             ).scalar() or 0
             
-            # Get the bonuses for the current month
+            # bonusuri în luna precedentă
             bonuses = Bonus.query.filter(
                 Bonus.employee_id == employee.employee_id,
-                Bonus.month >= current_month_start,
-                Bonus.month <= current_month_end
+                Bonus.month >= start,
+                Bonus.month <= end
             ).all()
             
-            # Prepare the data for Excel
+            # pregătim structura pentru Excel
             employee_info = {
                 'name': employee.full_name,
                 'email': employee.email,
@@ -339,7 +337,6 @@ def get_employee_data_for_excel(email_addresses):
                 'bonuses': []
             }
             
-            # Add the bonuses
             for bonus in bonuses:
                 employee_info['bonuses'].append({
                     'amount': float(bonus.amount) if bonus.amount else 0.0,
@@ -351,7 +348,7 @@ def get_employee_data_for_excel(email_addresses):
         return employees_data
     
     except Exception as e:
-        print(f"Error collecting employee data: {e}")
+        print(f"Error collecting employee data for Excel: {e}")
         return []
 
 def create_excel_file(employees_data, output_path):
@@ -420,14 +417,13 @@ def create_excel_file(employees_data, output_path):
 
 def get_employee_data_for_pdf(email_addresses):
     """
-    Collects the data required for the PDF export.
-    Only personal details (first & last name, employee ID, CNP) and
-    the salary due for the current month are returned.
+    Colectează datele necesare pentru exportul PDF
+    (doar detalii personale și salariul datorat)
+    pentru luna precedentă față de data curentă.
     """
     try:
         employees_data = []
-        current_month_start = get_current_month_start()
-        current_month_end   = get_current_month_end()
+        start, end = get_previous_month_range()
 
         for email in (e.strip() for e in email_addresses):
             if not email:
@@ -439,16 +435,16 @@ def get_employee_data_for_pdf(email_addresses):
 
             salary_rec = Salary.query.filter(
                 Salary.employee_id == employee.employee_id,
-                Salary.month        >= current_month_start,
-                Salary.month        <= current_month_end
+                Salary.month >= start,
+                Salary.month <= end
             ).first()
 
             employees_data.append({
-                "employee_id":   employee.employee_id,
-                "first_name":    employee.first_name or "",
-                "last_name":     employee.last_name  or "",
-                "cnp":           employee.cnp        or "",
-                "salary":        float(salary_rec.base_salary) if salary_rec and salary_rec.base_salary else 0.0,
+                "employee_id": employee.employee_id,
+                "first_name":  employee.first_name or "",
+                "last_name":   employee.last_name or "",
+                "cnp":         employee.cnp or "",
+                "salary":      float(salary_rec.base_salary) if salary_rec and salary_rec.base_salary else 0.0,
             })
 
         return employees_data
@@ -601,6 +597,300 @@ def send_file_via_email(
         print(f"Eroare la trimiterea email-ului: {e}")
         return False
 
+# ----------------------------- Archives helper functions --------------------------------
+_pending_excel_for_managers = {}
+_manager_archives_in_progress = {}  # Nou: tracker pentru arhivele în progres
+_manager_expected_employees = {}  # manager_email -> set of employee_emails
+
+def create_archive_for_manager(manager_email, excel_path, pdf_files):
+    """
+    Creeaza arhiva finala cu Excel + toate PDF-urile (manager + employees)
+    si o muta in folderul archives_final
+    """
+    try:
+        # Folderul temporar pentru arhive
+        temp_archive_folder = "C:\\Users\\virosca\\Documents\\programs_python\\tema2\\app\\archives"
+        # Folderul final pentru arhive complete
+        final_archive_folder = "C:\\Users\\virosca\\Documents\\programs_python\\tema2\\app\\archives_final"
+        
+        os.makedirs(temp_archive_folder, exist_ok=True)
+        os.makedirs(final_archive_folder, exist_ok=True)
+        
+        # Gaseste managerul
+        manager = Employee.query.filter_by(email=manager_email).first()
+        if not manager:
+            print(f"Manager not found: {manager_email}")
+            return False
+        
+        # Creează numele arhivei
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        archive_name = f"manager_{manager.employee_id}_{timestamp}.zip"
+        temp_archive_path = os.path.join(temp_archive_folder, archive_name)
+        final_archive_path = os.path.join(final_archive_folder, archive_name)
+        
+        # Lista fișierelor de inclus în arhivă
+        files_to_archive = []
+        
+        # Adaugă Excel-ul
+        if excel_path and os.path.exists(excel_path):
+            files_to_archive.append(excel_path)
+            print(f"Added Excel to archive: {excel_path}")
+        
+        # Adaugă toate PDF-urile
+        for pdf_file in pdf_files:
+            if os.path.exists(pdf_file):
+                files_to_archive.append(pdf_file)
+                print(f"Added PDF to archive: {pdf_file}")
+        
+        if not files_to_archive:
+            print("No files to archive")
+            return False
+        
+        # Creează arhiva ZIP temporară
+        with zipfile.ZipFile(temp_archive_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for file_path in files_to_archive:
+                # Folosește doar numele fișierului în arhivă (fără path-ul complet)
+                arcname = os.path.basename(file_path)
+                zipf.write(file_path, arcname)
+                print(f"Archived: {file_path} as {arcname}")
+        
+        # Mută arhiva în folderul final
+        shutil.move(temp_archive_path, final_archive_path)
+        print(f"Archive moved to final location: {final_archive_path}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"Error creating archive: {e}")
+        return False
+
+def init_manager_archive_with_employees(manager_email, excel_path, expected_employee_emails):
+    """
+    Inițializează o arhivă pentru manager și înregistrează lista de angajați așteptați
+    """
+    try:
+        global _manager_archives_in_progress, _manager_expected_employees
+        
+        # Folderul temporar pentru arhive
+        temp_archive_folder = "C:\\Users\\virosca\\Documents\\programs_python\\tema2\\app\\archives"
+        os.makedirs(temp_archive_folder, exist_ok=True)
+        
+        # Găsește managerul
+        manager = Employee.query.filter_by(email=manager_email).first()
+        if not manager:
+            print(f"Manager not found: {manager_email}")
+            return False
+        
+        # Creează numele arhivei
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        archive_name = f"manager_{manager.employee_id}_{timestamp}.zip"
+        temp_archive_path = os.path.join(temp_archive_folder, archive_name)
+        
+        # Creează arhiva inițială cu Excel-ul
+        with zipfile.ZipFile(temp_archive_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            if excel_path and os.path.exists(excel_path):
+                arcname = os.path.basename(excel_path)
+                zipf.write(excel_path, arcname)
+                print(f"Initialized archive with Excel: {excel_path}")
+        
+        # Salvează informația despre arhiva în progres
+        _manager_archives_in_progress[manager_email] = {
+            'archive_path': temp_archive_path,
+            'manager_id': manager.employee_id,
+            'timestamp': datetime.now(),
+            'pdf_count': 0,
+            'received_pdfs': set()  # email-urile care au primit deja PDF-uri
+        }
+        
+        # Înregistrează angajații așteptați pentru acest manager
+        _manager_expected_employees[manager_email] = set(expected_employee_emails)
+        
+        print(f"Archive initialized for manager {manager_email}: {temp_archive_path}")
+        print(f"Expected employees: {expected_employee_emails}")
+        return True
+        
+    except Exception as e:
+        print(f"Error initializing manager archive: {e}")
+        return False
+
+
+def add_pdf_to_manager_archive(manager_email, pdf_path):
+    """
+    Adaugă un PDF la arhiva managerului (în progres)
+    """
+    try:
+        global _manager_archives_in_progress
+        
+        if manager_email not in _manager_archives_in_progress:
+            print(f"No archive in progress for manager: {manager_email}")
+            return False
+        
+        archive_info = _manager_archives_in_progress[manager_email]
+        archive_path = archive_info['archive_path']
+        
+        if not os.path.exists(archive_path):
+            print(f"Archive file not found: {archive_path}")
+            return False
+        
+        if not os.path.exists(pdf_path):
+            print(f"PDF file not found: {pdf_path}")
+            return False
+        
+        # Citește arhiva existentă și adaugă noul PDF
+        temp_path = f"{archive_path}.tmp"
+        with zipfile.ZipFile(archive_path, 'r') as source_zip:
+            with zipfile.ZipFile(temp_path, 'w', zipfile.ZIP_DEFLATED) as target_zip:
+                # Copiază toate fișierele existente
+                for item in source_zip.infolist():
+                    data = source_zip.read(item.filename)
+                    target_zip.writestr(item, data)
+                
+                # Adaugă noul PDF
+                arcname = os.path.basename(pdf_path)
+                target_zip.write(pdf_path, arcname)
+                print(f"Added PDF to archive: {pdf_path}")
+        
+        # Înlocuiește arhiva originală cu cea actualizată
+        os.replace(temp_path, archive_path)
+        
+        # Actualizează contorul
+        archive_info['pdf_count'] += 1
+        
+        return True
+        
+    except Exception as e:
+        print(f"Error adding PDF to manager archive: {e}")
+        return False
+
+def finalize_manager_archive(manager_email):
+    """
+    Finalizează arhiva managerului și o mută în folderul archives_final
+    """
+    try:
+        global _manager_archives_in_progress
+        
+        if manager_email not in _manager_archives_in_progress:
+            print(f"No archive in progress for manager: {manager_email}")
+            return False
+        
+        archive_info = _manager_archives_in_progress[manager_email]
+        temp_archive_path = archive_info['archive_path']
+        
+        # Folderul final pentru arhive complete
+        final_archive_folder = "C:\\Users\\virosca\\Documents\\programs_python\\tema2\\app\\archives_final"
+        os.makedirs(final_archive_folder, exist_ok=True)
+        
+        # Calculează path-ul final
+        archive_name = os.path.basename(temp_archive_path)
+        final_archive_path = os.path.join(final_archive_folder, archive_name)
+        
+        # Mută arhiva din archives în archives_final
+        shutil.move(temp_archive_path, final_archive_path)
+        
+        print(f"Archive finalized and moved to: {final_archive_path}")
+        print(f"Total PDFs in archive: {archive_info['pdf_count']}")
+        
+        # Curăță din tracking
+        del _manager_archives_in_progress[manager_email]
+        
+        return True
+        
+    except Exception as e:
+        print(f"Error finalizing manager archive: {e}")
+        return False
+
+def check_and_create_archive_for_manager(manager_email, excel_path):
+    """
+    Înregistrează Excel-ul și determină toți angajații care vor primi PDF-uri
+    """
+    try:
+        global _pending_excel_for_managers
+        
+        # Găsește managerul
+        manager = Employee.query.filter_by(email=manager_email).first()
+        if not manager:
+            print(f"Manager not found: {manager_email}")
+            return
+        
+        # Găsește toți angajații sub acest manager
+        manager_employees = Employee.query.filter_by(manager_id=manager.employee_id).all()
+        expected_emails = [emp.email for emp in manager_employees] + [manager_email]  # include managerul
+        
+        print(f"Manager {manager_email} expects PDFs for: {expected_emails}")
+        
+        _pending_excel_for_managers[manager_email] = {
+            'excel_path': excel_path,
+            'timestamp': datetime.now(),
+            'expected_employees': set(expected_emails)
+        }
+        
+        # Inițializează arhiva cu lista completă de angajați așteptați
+        init_manager_archive_with_employees(manager_email, excel_path, expected_emails)
+        
+    except Exception as e:
+        print(f"Error in check_and_create_archive_for_manager_complete: {e}")
+
+def check_and_create_archive_for_manager_with_pdfs(manager_email, pdf_files):
+    """
+    Verifică și construiește progresiv arhiva când s-au trimis PDF-urile
+    Finalizează arhiva doar când toate PDF-urile au fost adăugate
+    """
+    try:
+        global _pending_excel_for_managers, _manager_archives_in_progress
+        
+        # Verifică dacă există Excel trimis recent pentru acest manager
+        if manager_email in _pending_excel_for_managers:
+            excel_info = _pending_excel_for_managers[manager_email]
+            
+            # Verifică dacă Excel-ul a fost trimis în ultimele 10 minute
+            time_diff = datetime.now() - excel_info['timestamp']
+            if time_diff.total_seconds() <= 600:
+                
+                # Găsește managerul
+                manager = Employee.query.filter_by(email=manager_email).first()
+                if not manager:
+                    print(f"Manager not found: {manager_email}")
+                    return
+                
+                print(f"Processing archive for manager {manager_email}")
+                print(f"PDF files to add: {len(pdf_files)}")
+                
+                # Verifică dacă arhiva este în progres
+                if manager_email in _manager_archives_in_progress:
+                    # Adaugă toate PDF-urile la arhiva în progres
+                    successful_adds = 0
+                    for pdf_file in pdf_files:
+                        if os.path.exists(pdf_file):
+                            if add_pdf_to_manager_archive(manager_email, pdf_file):
+                                successful_adds += 1
+                                print(f"  Successfully added: {os.path.basename(pdf_file)}")
+                            else:
+                                print(f"  Failed to add: {os.path.basename(pdf_file)}")
+                        else:
+                            print(f"  PDF not found: {pdf_file}")
+                    
+                    print(f"Successfully added {successful_adds}/{len(pdf_files)} PDFs to archive")
+                    
+                    # Finalizează arhiva (mută în archives_final)
+                    if finalize_manager_archive(manager_email):
+                        print(f"Archive successfully finalized for manager {manager_email}")
+                        # Curăță din pending
+                        del _pending_excel_for_managers[manager_email]
+                    else:
+                        print(f"Failed to finalize archive for manager {manager_email}")
+                        
+                else:
+                    print(f"No archive in progress found for manager {manager_email}")
+                    
+            else:
+                print(f"Excel for manager {manager_email} is too old ({time_diff.total_seconds()} seconds)")
+                # Curăță intrarea expirată
+                del _pending_excel_for_managers[manager_email]
+        else:
+            print(f"No pending Excel found for manager {manager_email}")
+            
+    except Exception as e:
+        print(f"Error in check_and_create_archive_for_manager_with_pdfs: {e}")
 
 # ----------------------------- API ENDPOINTS --------------------------------
 
@@ -1024,236 +1314,203 @@ class Controller:
         elif self.model.getLastChoice() == 4:
             self.handle_send_pdf(first_input_box_text, second_input_box_text)
     
+    
+    def add_pdf_to_relevant_manager_archives(self, employee_email, pdf_path):
+        """
+        Adaugă PDF-ul la arhivele tuturor managerilor relevanți
+        """
+        try:
+            global _manager_archives_in_progress
+            
+            emp = Employee.query.filter_by(email=employee_email).first()
+            if not emp:
+                return
+            
+            for manager_email, archive_info in _manager_archives_in_progress.items():
+                manager = Employee.query.filter_by(email=manager_email).first()
+                if not manager:
+                    continue
+                    
+                # Verifică dacă angajatul aparține acestui manager sau este managerul însuși
+                if emp.employee_id == manager.employee_id or emp.manager_id == manager.employee_id:
+                    if add_pdf_to_manager_archive(manager_email, pdf_path):
+                        archive_info['received_pdfs'].add(employee_email)
+                        print(f"Added PDF for {employee_email} to manager {manager_email} archive")
+                    
+        except Exception as e:
+            print(f"Error adding PDF to manager archives: {e}")
+
+    def check_and_finalize_complete_archives(self):
+        """
+        Verifică și finalizează doar arhivele care sunt complete
+        """
+        try:
+            global _manager_archives_in_progress, _manager_expected_employees, _pending_excel_for_managers
+            
+            managers_to_finalize = []
+            
+            for manager_email, archive_info in _manager_archives_in_progress.items():
+                if manager_email in _manager_expected_employees:
+                    expected_employees = _manager_expected_employees[manager_email]
+                    received_pdfs = archive_info['received_pdfs']
+                    
+                    print(f"Manager {manager_email}:")
+                    print(f"  Expected: {expected_employees}")
+                    print(f"  Received: {received_pdfs}")
+                    
+                    # Verifică dacă toți angajații așteptați au primit PDF-uri
+                    if expected_employees.issubset(received_pdfs):
+                        print(f"  Archive is complete! Marking for finalization.")
+                        managers_to_finalize.append(manager_email)
+                    else:
+                        missing = expected_employees - received_pdfs
+                        print(f"  Still waiting for: {missing}")
+            
+            # Finalizează arhivele complete
+            for manager_email in managers_to_finalize:
+                if finalize_manager_archive(manager_email):
+                    print(f"Archive successfully finalized for manager {manager_email}")
+                    # Curăță tracking-ul
+                    if manager_email in _manager_expected_employees:
+                        del _manager_expected_employees[manager_email]
+                    if manager_email in _pending_excel_for_managers:
+                        del _pending_excel_for_managers[manager_email]
+                else:
+                    print(f"Failed to finalize archive for manager {manager_email}")
+                    
+        except Exception as e:
+            print(f"Error checking and finalizing archives: {e}")
+
     def handle_send_pdf(self, input_text, second_input_text):
         """
-        Gestioneaza trimiterea prin email a fisierelor PDF.
-        Prima linie din input_text: path catre fisierul PDF.
-        second_input_text: adresele de email (una per linie).
-        Fiecare PDF va fi protejat cu parola = CNP-ul angajatului.
+        Versiunea îmbunătățită care verifică complet înainte de finalizare
         """
         try:
             lines = input_text.strip().split('\n')
-            if not lines or not lines[0].strip():
-                if self.model.sendPdfView:
-                    self.model.sendPdfView.setText("Error: No file path provided")
-                return
-            
-            pdf_path = lines[0].strip()
-            
-            # Verifica daca fisierul exista si este PDF
-            if not os.path.exists(pdf_path):
-                if self.model.sendPdfView:
-                    self.model.sendPdfView.setText("Error: File not found")
-                return
-            
-            if not pdf_path.lower().endswith('.pdf'):
-                if self.model.sendPdfView:
-                    self.model.sendPdfView.setText("Error: File is not a PDF")
+            pdf_path = lines[0].strip() if lines else ""
+            if not pdf_path or not os.path.exists(pdf_path) or not pdf_path.lower().endswith('.pdf'):
+                self.model.sendPdfView.setText("Error: File invalid or not found")
                 return
 
-            # Colecteaza email-urile din al doilea input box
-            emails = [e.strip() for e in (second_input_text.strip().split('\n')) if e.strip()]
+            emails = [e.strip() for e in second_input_text.splitlines() if e.strip()]
             if not emails:
-                if self.model.sendPdfView:
-                    self.model.sendPdfView.setText("Error: No email addresses provided")
+                self.model.sendPdfView.setText("Error: No email addresses provided")
                 return
 
-            results = []
+            results, sent_files = [], []
             successful_sends = 0
-            
+            successful_recipients = []
+
+            # Trimite PDF-urile către toți destinatarii
             for email in emails:
-                try:
-                    # Gaseste angajatul si CNP-ul
-                    emp = Employee.query.filter_by(email=email).first()
-                    if not emp or not emp.cnp:
-                        results.append(f"{email}: Employee or CNP not found")
-                        continue
+                emp = Employee.query.filter_by(email=email).first()
+                if not emp or not emp.cnp:
+                    results.append(f"{email}: Employee or CNP not found")
+                    continue
 
-                    # Creeaza fisierul PDF criptat
-                    reader = PdfReader(pdf_path)
-                    writer = PdfWriter()
+                # Creează PDF criptat
+                reader = PdfReader(pdf_path)
+                writer = PdfWriter()
+                for p in reader.pages:
+                    writer.add_page(p)
+                writer.encrypt(user_password=emp.cnp, owner_password=emp.cnp)
+
+                base = os.path.splitext(os.path.basename(pdf_path))[0]
+                enc_name = f"{base}_encrypted_{emp.employee_id}.pdf"
+                encrypted_path = os.path.join(os.path.dirname(pdf_path), enc_name)
+                
+                with open(encrypted_path, 'wb') as out_f:
+                    writer.write(out_f)
+
+                # Trimite emailul
+                sent = send_file_via_email(encrypted_path, [email])
+                status = 'sent' if sent else 'failed'
+                results.append(f"{email}: {status}")
+
+                if sent:
+                    successful_sends += 1
+                    successful_recipients.append(email)
+                    sent_files.append(encrypted_path)
                     
-                    # Adauga toate paginile
-                    for page in reader.pages:
-                        writer.add_page(page)
-                    
-                    # Cripteaza cu CNP-ul angajatului
-                    writer.encrypt(user_password=emp.cnp, owner_password=emp.cnp)
+                    # Salvează în baza de date
+                    db.session.add(ArchivedFile(
+                        employee_id=emp.employee_id,
+                        file_name=enc_name,
+                        file_type='PDF',
+                        path=encrypted_path,
+                        sent_date=date.today()
+                    ))
 
-                    # Creeaza path-ul pentru fisierul criptat
-                    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
-                    encrypted_filename = f"{base_name}_encrypted_{emp.employee_id}.pdf"
-                    encrypted_path = os.path.join(os.path.dirname(pdf_path), encrypted_filename)
-                    
-                    # Salveaza fiaierul criptat
-                    with open(encrypted_path, 'wb') as out_f:
-                        writer.write(out_f)
+                    # Adaugă la arhivele managerilor relevanți
+                    self.add_pdf_to_relevant_manager_archives(email, encrypted_path)
 
-                    # Verifica ca fisierul criptat a fost creat
-                    if not os.path.exists(encrypted_path):
-                        results.append(f"{email}: Failed to create encrypted PDF")
-                        continue
+            # Commit la baza de date
+            db.session.commit()
 
-                    # Trimite email-ul
-                    print(f"Attempting to send {encrypted_path} to {email}")
-                    success = send_file_via_email(encrypted_path, [email])
-                    
-                    if success:
-                        successful_sends += 1
-                        results.append(f"{email}: sent")
-                        
-                        # Arhiveaza daca a fost trimis cu succes
-                        try:
-                            arch = ArchivedFile(
-                                employee_id=emp.employee_id,
-                                file_name=encrypted_filename,
-                                file_type='PDF',
-                                path=encrypted_path,
-                                sent_date=date.today()
-                            )
-                            db.session.add(arch)
-                        except Exception as archive_error:
-                            print(f"Archive error for {email}: {archive_error}")
-                            
-                    else:
-                        results.append(f"{email}: failed to send")
-                        
-                except Exception as e:
-                    print(f"Error processing {email}: {str(e)}")
-                    results.append(f"{email}: Error - {str(e)}")
+            # Verifică și finalizează arhivele complete
+            self.check_and_finalize_complete_archives()
 
-            # Commit la baza de date pentru arhivare
-            try:
-                db.session.commit()
-            except Exception as commit_error:
-                print(f"Database commit error: {commit_error}")
-                db.session.rollback()
+            # Afișează mesajul cu rezultatele
+            if successful_recipients:
+                receivers_text = ", ".join(successful_recipients[:3])
+                if len(successful_recipients) > 3:
+                    receivers_text += f" (+{len(successful_recipients)-3} more)"
+                self.model.sendPdfView.setText(f"PDF sent to: {receivers_text}")
+            else:
+                self.model.sendPdfView.setText("No PDFs sent successfully")
 
-            # Actualizeaza view-ul cu rezultatele
-            if self.model.sendPdfView:
-                summary = f"Sent: {successful_sends}/{len(emails)}. Details: " + "; ".join(results[:3])  # Limiteaza output-ul
-                if len(results) > 3:
-                    summary += f"... and {len(results) - 3} more"
-                self.model.sendPdfView.setText(summary)
-                    
         except Exception as e:
-            print(f"Send PDF error: {e}")
-            if self.model.sendPdfView:
-                self.model.sendPdfView.setText(f"Error: {str(e)}")
-
-
-    # Funcție helper pentru debugging
-    def debug_pdf_sending(pdf_path, email):
-        """
-        Funcție de debugging pentru a testa trimiterea PDF-urilor
-        """
-        print(f"=== DEBUG PDF SENDING ===")
-        print(f"PDF Path: {pdf_path}")
-        print(f"File exists: {os.path.exists(pdf_path)}")
-        print(f"Email: {email}")
-        
-        # Verifică angajatul
-        emp = Employee.query.filter_by(email=email).first()
-        if emp:
-            print(f"Employee found: {emp.full_name}, CNP: {emp.cnp}")
-        else:
-            print("Employee not found")
-            return False
-        
-        try:
-            # Test PDF reading
-            reader = PdfReader(pdf_path)
-            print(f"PDF pages: {len(reader.pages)}")
-            
-            # Test encryption
-            writer = PdfWriter()
-            for page in reader.pages:
-                writer.add_page(page)
-            writer.encrypt(user_password=emp.cnp, owner_password=emp.cnp)
-            
-            test_path = f"test_encrypted_{emp.employee_id}.pdf"
-            with open(test_path, 'wb') as f:
-                writer.write(f)
-            
-            print(f"Encrypted PDF created: {test_path}")
-            print(f"Encrypted file size: {os.path.getsize(test_path)} bytes")
-            
-            return True
-            
-        except Exception as e:
-            print(f"Error in PDF processing: {e}")
-            return False
+            self.model.sendPdfView.setText(f"Error: {e}")
+            print(f"Error in handle_send_pdf_fixed: {e}")
     
     def handle_send_excel(self, input_text, second_input_text):
         """
-        Gestioneaza trimiterea prin email a fisierului Excel
-        Prima linie din input_text = path catre fisierul Excel
-        second_input_text = email-urile destinatarilor (cate unul pe linie)
+        Versiunea actualizată pentru trimiterea Excel-ului
         """
         try:
             lines = input_text.strip().split('\n')
-            if not lines or not lines[0].strip():
-                if self.model.factView:  # Folosim factView pentru "send Excel"
-                    self.model.factView.setText("Error: No file path provided")
+            file_path = lines[0].strip() if lines else ""
+            if not file_path or not os.path.exists(file_path):
+                self.model.factView.setText("Error: File not found")
                 return
-            
-            # Prima linie este path-ul către fișierul Excel
-            file_path = lines[0].strip()
-            
-            # Verifica daca fisierul exista
-            if not os.path.exists(file_path):
-                if self.model.factView:
-                    self.model.factView.setText("Error: File not found")
-                return
-            
-            # Colecteaza email-urile din al doilea input box
-            if second_input_text.strip():
-                email_lines = second_input_text.strip().split('\n')
-                recipient_emails = [email.strip() for email in email_lines if email.strip()]
-            else:
-                if self.model.factView:
-                    self.model.factView.setText("Error: No email addresses provided")
-                return
-            
+
+            recipient_emails = [e.strip() for e in second_input_text.splitlines() if e.strip()]
             if not recipient_emails:
-                if self.model.factView:
-                    self.model.factView.setText("Error: No valid email addresses")
+                self.model.factView.setText("Error: No email addresses provided")
                 return
-            
-            # Trimite fisierul prin email
+
             success = send_file_via_email(file_path, recipient_emails)
+            if not success:
+                self.model.factView.setText("Error: Failed to send email")
+                return
+
+            # Pentru fiecare manager din listă, folosește noua logică
+            for email in recipient_emails:
+                emp = Employee.query.filter_by(email=email).first()
+                if emp and emp.role == 'manager':
+                    check_and_create_archive_for_manager(email, file_path)
+
+            # Salvează în arhivă
+            for email in recipient_emails:
+                emp = Employee.query.filter_by(email=email).first()
+                db.session.add(ArchivedFile(
+                    employee_id=emp.employee_id if emp else None,
+                    file_name=os.path.basename(file_path),
+                    file_type='Excel',
+                    path=file_path,
+                    sent_date=date.today()
+                ))
+            db.session.commit()
+
+            # Afișează mesajul cu lista receiverilor
+            receivers_text = ", ".join(recipient_emails[:3])
+            if len(recipient_emails) > 3:
+                receivers_text += f" (+{len(recipient_emails)-3} more)"
             
-            if success:
-                # Salveaza in arhiva
-                try:
-                    filename = os.path.basename(file_path)
-                    for email in recipient_emails:
-                        employee = Employee.query.filter_by(email=email).first()
-                        employee_id = employee.employee_id if employee else None
-                        
-                        archived_file = ArchivedFile(
-                            employee_id=employee_id,
-                            file_name=filename,
-                            file_type='Excel',
-                            path=file_path,
-                            sent_date=date.today()
-                        )
-                        db.session.add(archived_file)
-                    
-                    db.session.commit()
-                except Exception as e:
-                    print(f"Error saving to archive: {e}")
-                
-                if self.model.factView:
-                    self.model.factView.setText(f"Excel sent to {len(recipient_emails)} recipients")
-            else:
-                if self.model.factView:
-                    self.model.factView.setText("Error: Failed to send email")
-                    
+            self.model.factView.setText(f"Excel sent to: {receivers_text}")
+            
         except Exception as e:
-            if self.model.factView:
-                self.model.factView.setText(f"Error: {str(e)}")
-            print(f"Send Excel error: {e}")
+            self.model.factView.setText(f"Error: {e}")
     
     def handle_excel_export(self, input_text, second_input_text):
         """
