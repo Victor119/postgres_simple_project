@@ -11,7 +11,7 @@ from pypdf import PdfReader, PdfWriter
 import pandas as pd
 import requests
 import shutil
-from typing import List
+from typing import List, Dict
 import zipfile
 
 app = Flask(__name__)
@@ -892,224 +892,188 @@ def check_and_create_archive_for_manager_with_pdfs(manager_email, pdf_files):
     except Exception as e:
         print(f"Error in check_and_create_archive_for_manager_with_pdfs: {e}")
 
+# ----------------------------- API ENDPOINTS HELPER FUNCTIONS --------------------------------
+
+def export_excel(output_folder: str, email_addresses: List[str]) -> str:
+    """Returnează calea completă a fișierului .xlsx creat sau ridică excepție."""
+    os.makedirs(output_folder, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"employee_summary_{timestamp}.xlsx"
+    output_path = os.path.join(output_folder, filename)
+
+    employees_data = get_employee_data_for_excel(email_addresses)
+    if not employees_data:
+        raise ValueError("No employee data found")
+    if not create_excel_file(employees_data, output_path):
+        raise RuntimeError("Failed to create Excel file")
+
+    return output_path
+
+
+def export_pdf(output_folder: str, email_addresses: List[str]) -> str:
+    """Returnează calea completă a fișierului .pdf creat sau ridică excepție."""
+    os.makedirs(output_folder, exist_ok=True)
+    data = get_employee_data_for_pdf(email_addresses)
+    if not data:
+        raise ValueError("No employee data found")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"employee_summary_{timestamp}.pdf"
+    output_path = os.path.join(output_folder, filename)
+
+    if not create_pdf_file(data, output_path):
+        raise RuntimeError("Failed to create PDF file")
+
+    return output_path
+
+
+def send_excel(file_path: str, recipient_emails: List[str]) -> None:
+    """Trimite Excel-ul și, în caz că recipientul e manager, iniţializează arhiva."""
+    if not send_file_via_email(file_path, recipient_emails):
+        raise RuntimeError("Failed to send Excel")
+    # salvare în arhivă
+    for email in recipient_emails:
+        emp = Employee.query.filter_by(email=email).first()
+        db.session.add(ArchivedFile(
+            employee_id=emp.employee_id if emp else None,
+            file_name=os.path.basename(file_path),
+            file_type='Excel',
+            path=file_path,
+            sent_date=date.today()
+        ))
+        # dacă e manager, iniţializează arhiva
+        if emp and emp.role == 'manager':
+            check_and_create_archive_for_manager(email, file_path)
+    db.session.commit()
+
+
+def send_pdfs(file_path: str, recipient_emails: List[str]) -> Dict[str, str]:
+    """
+    Criptează cu CNP pentru fiecare angajat,
+    le trimite și le arhivează; returnează un dict email→status.
+    """
+    results = {}
+    for email in recipient_emails:
+        emp = Employee.query.filter_by(email=email).first()
+        if not emp or not emp.cnp:
+            results[email] = 'Employee or CNP not found'
+            continue
+
+        # creează fișier criptat
+        reader = PdfReader(file_path)
+        writer = PdfWriter()
+        for p in reader.pages:
+            writer.add_page(p)
+        # Folosim parametrul corect user_password (și, opțional, owner_password)
+        writer.encrypt(
+            user_password=emp.cnp,
+            owner_password=emp.cnp,
+            use_128bit=True
+        )
+
+        # generează numele și calea fișierului criptat
+        base = os.path.splitext(os.path.basename(file_path))[0]
+        enc_name = f"{base}_{emp.employee_id}.pdf"
+        enc_path = os.path.join(os.path.dirname(file_path), enc_name)
+        with open(enc_path, 'wb') as out_f:
+            writer.write(out_f)
+
+        # trimite prin Graph API
+        sent = send_file_via_email(enc_path, [email])
+        results[email] = 'sent' if sent else 'failed'
+
+        if sent:
+            # salvează în arhiva
+            db.session.add(ArchivedFile(
+                employee_id=emp.employee_id,
+                file_name=enc_name,
+                file_type='PDF',
+                path=enc_path,
+                sent_date=date.today()
+            ))
+            # adauga PDF-ul in arhivele managerilor relevanti
+            Controller().add_pdf_to_relevant_manager_archives(email, enc_path)
+
+    db.session.commit()
+    # incearca sa finalizeze arhivele complete
+    Controller().check_and_finalize_complete_archives()
+    return results
+
 # ----------------------------- API ENDPOINTS --------------------------------
 
 @app.route("/createAggregatedEmployeeData", methods=["POST"])
 def create_aggregated_employee_data():
-    """
-    API endpoint pentru generarea raportului Excel cu datele angajaților
-    """
+    data = request.get_json() or {}
+    folder = data.get('output_folder', 'app/generated_excel')
+    emails = data.get('emails') or []
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({'error': 'No JSON data provided'}), 400
-        
-        email_addresses = data.get('emails', [])
-        output_folder = data.get('output_folder', 'app/generated_excel')
-        
-        if not email_addresses:
-            return jsonify({'error': 'No email addresses provided'}), 400
-        
-        # make sure folder exists
-        os.makedirs(output_folder, exist_ok=True)
-        
-        # generate file name with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"employee_summary_{timestamp}.xlsx"
-        output_path = os.path.join(output_folder, filename)
-        
-        # collect data about employee
-        employees_data = get_employee_data_for_excel(email_addresses)
-        
-        if not employees_data:
-            return jsonify({'error': 'No employee data found for provided emails'}), 404
-        
-        # create excel file
-        success = create_excel_file(employees_data, output_path)
-        
-        if success:
-            return jsonify({
-                'success': True,
-                'filename': filename,
-                'path': output_path,
-                'message': f'{filename} created successfully'
-            }), 200
-        else:
-            return jsonify({'error': 'Failed to create Excel file'}), 500
-            
+        path = export_excel(folder, emails)
+        return jsonify({
+            'success': True,
+            'filename': os.path.basename(path),
+            'path': path,
+            'message': f'{os.path.basename(path)} created successfully'
+        }), 200
+    except ValueError as ve:
+        return jsonify({'error': str(ve)}), 404
     except Exception as e:
-        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
+        return jsonify({'error': str(e)}), 500
 
 @app.route("/createPdfForEmployees", methods=["POST"])
 def create_pdf_for_employees():
-    """
-    REST endpoint that receives a JSON body:
-        { "emails": ["a@b.com", …], "output_folder": "app/generated_pdf" }
-    and returns a single aggregated PDF report.
-    """
+    data = request.get_json() or {}
+    folder = data.get('output_folder', 'app/generated_pdf')
+    emails = data.get('emails') or []
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "No JSON data provided"}), 400
-
-        email_addresses = data.get("emails", [])
-        output_folder   = data.get("output_folder", "app/generated_pdf")
-
-        if not email_addresses:
-            return jsonify({"error": "No email addresses provided"}), 400
-
-        os.makedirs(output_folder, exist_ok=True)
-        employees_data = get_employee_data_for_pdf(email_addresses)
-        if not employees_data:
-            return jsonify({"error": "No employee data found for provided emails"}), 404
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename  = f"employee_summary_{timestamp}.pdf"
-        output_path = os.path.join(output_folder, filename)
-
-        if create_pdf_file(employees_data, output_path):
-            return jsonify({
-                "success": True,
-                "filename": filename,
-                "path": output_path,
-                "message": f"{filename} created successfully"
-            }), 200
-        else:
-            return jsonify({"error": "Failed to create PDF file"}), 500
-
+        path = export_pdf(folder, emails)
+        return jsonify({
+            'success': True,
+            'filename': os.path.basename(path),
+            'path': path,
+            'message': f'{os.path.basename(path)} created successfully'
+        }), 200
+    except ValueError as ve:
+        return jsonify({'error': str(ve)}), 404
     except Exception as e:
-        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+        return jsonify({'error': str(e)}), 500
 
 @app.route("/sendAggregatedEmployeeData", methods=["POST"])
 def send_aggregated_employee_data():
-    """
-    API endpoint pentru trimiterea prin email a raportului Excel
-    Primeste JSON cu: 
-    {
-        "file_path": "app/generated_excel/employee_summary_timestamp.xlsx",
-        "emails": ["manager@acme.com", "hr@acme.com"]
-    }
-    """
+    data = request.get_json() or {}
+    file_path = data.get('file_path', '').strip()
+    emails = data.get('emails') or []
+    if not file_path:
+        return jsonify({'error': 'No file path provided'}), 400
+    if not os.path.exists(file_path):
+        return jsonify({'error': f'File not found: {file_path}'}), 404
+
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({'error': 'No JSON data provided'}), 400
-        
-        file_path = data.get('file_path', '')
-        recipient_emails = data.get('emails', [])
-        
-        if not file_path:
-            return jsonify({'error': 'No file path provided'}), 400
-        
-        if not recipient_emails:
-            return jsonify({'error': 'No recipient emails provided'}), 400
-        
-        # Check if the file exists
-        if not os.path.exists(file_path):
-            return jsonify({'error': f'File not found: {file_path}'}), 404
-        
-        # Send the email
-        success = send_file_via_email(file_path, recipient_emails)
-        
-        if success:
-            # Save information in the database for archive
-            try:
-                filename = os.path.basename(file_path)
-                for email in recipient_emails:
-                    # Find employee_id by email (optional)
-                    employee = Employee.query.filter_by(email=email).first()
-                    employee_id = employee.employee_id if employee else None
-                    
-                    archived_file = ArchivedFile(
-                        employee_id=employee_id,
-                        file_name=filename,
-                        file_type='Excel',
-                        path=file_path,
-                        sent_date=date.today()
-                    )
-                    db.session.add(archived_file)
-                
-                db.session.commit()
-            except Exception as e:
-                print(f"Error saving to archive: {e}")
-                # We are not returning an error because the email was sent successfully
-            
-            return jsonify({
-                'success': True,
-                'message': f'Excel file sent successfully to {len(recipient_emails)} recipients',
-                'file_path': file_path,
-                'recipients': recipient_emails
-            }), 200
-        else:
-            return jsonify({'error': 'Failed to send email'}), 500
-            
+        send_excel(file_path, emails)
+        return jsonify({
+            'success': True,
+            'message': f'Excel file sent successfully to {len(emails)} recipients',
+            'file_path': file_path,
+            'recipients': emails
+        }), 200
     except Exception as e:
-        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
+        return jsonify({'error': str(e)}), 500
 
 @app.route("/sendPdfToEmployees", methods=["POST"])
 def send_pdf_to_employees():
-    """
-    API endpoint pentru trimiterea PDF-urilor protejate cu parola (CNP) catre angajati.
-    Asteapta JSON:
-    {
-        "file_path": "app/generated_pdf/employee_summary_....pdf",
-        "emails": ["a@b.com", "c@d.com"]
-    }
-    """
+    data = request.get_json() or {}
+    file_path = data.get('file_path', '').strip()
+    emails = data.get('emails') or []
+    if not file_path:
+        return jsonify({'error': 'No file path provided'}), 400
+    if not file_path.lower().endswith('.pdf'):
+        return jsonify({'error': 'Provided file is not a PDF'}), 400
+    if not os.path.exists(file_path):
+        return jsonify({'error': f'File not found: {file_path}'}), 404
+
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({'error': 'No JSON data provided'}), 400
-
-        pdf_path = data.get('file_path', '').strip()
-        emails   = data.get('emails', [])
-        if not pdf_path:
-            return jsonify({'error': 'No file path provided'}), 400
-        if not pdf_path.lower().endswith('.pdf'):
-            return jsonify({'error': 'Provided file is not a PDF'}), 400
-        if not emails:
-            return jsonify({'error': 'No recipient emails provided'}), 400
-        if not os.path.exists(pdf_path):
-            return jsonify({'error': f'File not found: {pdf_path}'}), 404
-
-        results = []
-        for email in emails:
-            emp = Employee.query.filter_by(email=email).first()
-            if not emp or not emp.cnp:
-                results.append({'email': email, 'status': 'Employee or CNP not found'})
-                continue
-
-            # encryption
-            reader = PdfReader(pdf_path)
-            writer = PdfWriter()
-            for p in reader.pages:
-                writer.add_page(p)
-            writer.encrypt(user_pwd=emp.cnp)
-
-            encrypted_path = f"{os.path.splitext(pdf_path)[0]}_{emp.employee_id}.pdf"
-            with open(encrypted_path, 'wb') as f_out:
-                writer.write(f_out)
-
-            # send
-            sent = send_file_via_email(encrypted_path, [email])
-            status = 'sent' if sent else 'failed'
-            results.append({'email': email, 'status': status})
-
-            if sent:
-                arch = ArchivedFile(
-                    employee_id=emp.employee_id,
-                    file_name=os.path.basename(encrypted_path),
-                    file_type='PDF',
-                    path=encrypted_path,
-                    sent_date=date.today()
-                )
-                db.session.add(arch)
-
-        db.session.commit()
+        results = send_pdfs(file_path, emails)
         return jsonify({'results': results}), 200
-
     except Exception as e:
-        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
+        return jsonify({'error': str(e)}), 500
 
 @app.errorhandler(404)
 def not_found(error):
