@@ -1,0 +1,3 @@
+de arata ca functioneaza rutele utilizand Postman
+
+de aratat cum se modifica DB-ul cu un phpMyAdmin sau ceva similar daca am lucrat cu DB
